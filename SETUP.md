@@ -5,43 +5,51 @@ Syncs files from NAS to Supabase S3 storage and extracts metadata to database.
 ## Prerequisites
 
 - Docker (Docker Desktop on Mac, or Synology Container Manager)
-- PostgreSQL database (Supabase)
+- Supabase instance (self-hosted or cloud)
 - Supabase S3 Storage credentials
 
-## Local Testing (Mac)
+## Database Backend Options
 
-Before deploying to NAS, test locally:
+| Backend | Protocol | Port | Use Case |
+|---------|----------|------|----------|
+| `rest` | HTTPS | 443 | Firewall-friendly, recommended |
+| `postgres` | PostgreSQL | 5432 | Faster for bulk ops, needs port open |
 
-```bash
-cd FileMetadataSync
-
-# 1. Create .env file (copy from env.example and fill in values)
-cp env.example .env
-
-# 2. Create test data
-chmod +x scripts/local_test.sh
-./scripts/local_test.sh
-
-# 3. Run with Docker Desktop
-docker-compose -f docker-compose.local.yml up --build
-
-# Or run single sync cycle:
-docker-compose -f docker-compose.local.yml run --rm file-metadata-sync python scripts/sync_once.py
-```
-
-## NAS Deployment
+Set via `DB_BACKEND=rest` or `DB_BACKEND=postgres` in `.env`.
 
 ## Quick Start
 
-### 1. Get Supabase S3 Credentials
+### 1. Run SQL Setup (required for REST backend)
 
-In Supabase Dashboard:
+The REST API can't query `storage.objects` directly. Run this SQL once:
+
+```sql
+-- sql/get_storage_object_id.sql
+CREATE OR REPLACE FUNCTION get_storage_object_id(p_bucket_id TEXT, p_object_name TEXT)
+RETURNS UUID
+LANGUAGE sql
+SECURITY DEFINER
+AS $$
+    SELECT id FROM storage.objects
+    WHERE bucket_id = p_bucket_id AND name = p_object_name
+    LIMIT 1;
+$$;
+
+GRANT EXECUTE ON FUNCTION get_storage_object_id TO service_role;
+```
+
+### 2. Get Credentials
+
+**For REST backend (recommended):**
+- `SUPABASE_URL`: Your Supabase URL (e.g., `https://api.ibhelm.de`)
+- `SUPABASE_SERVICE_KEY`: Service role key (Settings → API → service_role key)
+
+**For S3 Storage:**
 1. Go to **Settings** → **Storage**
-2. Enable S3 Protocol (if not already)
+2. Enable S3 Protocol
 3. Create S3 access keys
-4. Note the endpoint URL, access key, and secret key
 
-### 2. Create Environment File
+### 3. Create Environment File
 
 ```bash
 cp env.example .env
@@ -50,71 +58,84 @@ cp env.example .env
 Edit `.env`:
 
 ```env
-# Database - use your Supabase connection string
-PG_DSN=postgresql://postgres:PASSWORD@HOST:5432/postgres
+# REST backend (works over HTTPS/443)
+DB_BACKEND=rest
+SUPABASE_URL=https://api.ibhelm.de
+SUPABASE_SERVICE_KEY=your-service-role-key
 
 # S3 Storage
-S3_ENDPOINT=https://YOUR-PROJECT.supabase.co/storage/v1/s3
-S3_ACCESS_KEY=your-access-key
-S3_SECRET_KEY=your-secret-key
+S3_ENDPOINT=https://api.ibhelm.de/storage/v1/s3
+S3_ACCESS_KEY=your-s3-access-key
+S3_SECRET_KEY=your-s3-secret-key
 S3_BUCKET=files
-S3_REGION=eu-central-1
 
-# Source paths (container paths, see volume mounts)
-SYNC_SOURCE_PATHS=/data/projects,/data/documents
+# Source paths (container-internal, must match volume mount targets)
+SYNC_SOURCE_PATHS=/data/test
 
-# Sync every 15 minutes
-SYNC_INTERVAL=900
-
-# BetterStack (optional)
+# Logging
+LOG_LEVEL=DEBUG
 BETTERSTACK_SOURCE_TOKEN=your-token
-BETTERSTACK_INGEST_HOST=
-
-LOG_LEVEL=INFO
 ```
 
-### 3. Configure Volume Mounts
+### 4. Configure Volume Mounts
 
-Edit `docker-compose.yml` volumes section to mount your NAS folders:
+In `docker-compose.local.yml` (local) or `docker-compose.yml` (NAS):
 
 ```yaml
 volumes:
-  # NAS path : Container path
-  - /volume1/projects:/data/projects:ro
-  - /volume1/documents:/data/documents:ro
+  # External path : Container path
+  - ./test_data:/data/test:ro      # local
+  # - /volume1/projects:/data/projects:ro  # NAS
 ```
 
-**Important**: The container paths (`/data/projects`, etc.) must match `SYNC_SOURCE_PATHS`.
+**Important**: Container paths must match `SYNC_SOURCE_PATHS`.
 
-### 4. Deploy on Synology
+## Local Testing (Mac)
 
-#### Option A: Using Container Manager UI
+```bash
+cd FileMetadataSync
 
-1. Open Container Manager
-2. Go to **Project** → **Create**
-3. Set path to this folder
+# 1. Create .env (see above)
+cp env.example .env
+
+# 2. Create test data
+chmod +x scripts/local_test.sh
+./scripts/local_test.sh
+
+# 3. Build and run
+docker-compose -f docker-compose.local.yml up --build
+
+# Or single sync cycle:
+docker-compose -f docker-compose.local.yml run --rm file-metadata-sync python scripts/sync_once.py
+```
+
+## NAS Deployment
+
+### Using Container Manager UI
+
+1. Copy files to NAS
+2. Open Container Manager → **Project** → **Create**
+3. Set path to FileMetadataSync folder
 4. Select `docker-compose.yml`
-5. Click **Build** then **Run**
+5. Create `.env` file with production values
+6. Click **Build** then **Run**
 
-#### Option B: Using SSH
+### Using SSH
 
 ```bash
 cd /path/to/FileMetadataSync
 docker-compose up -d --build
 ```
 
-### 5. Verify
+### Verify
 
-Check logs:
 ```bash
 docker logs file-metadata-sync -f
 ```
 
-Or in Container Manager → Containers → file-metadata-sync → Logs
-
 ## How It Works
 
-1. **rclone sync**: Efficiently syncs files to S3 using checksums (only changed files)
+1. **rclone sync**: Efficiently syncs files to S3 using checksums
 2. **Metadata extraction**: For each synced file:
    - Calculates SHA256 content hash
    - Reads filesystem metadata (timestamps, permissions, inode)
@@ -124,7 +145,7 @@ Or in Container Manager → Containers → file-metadata-sync → Logs
 
 ## Database Schema
 
-Files are stored in `public.files` with these metadata fields:
+Files are stored in `public.files`:
 
 | Column | Description |
 |--------|-------------|
@@ -142,57 +163,50 @@ Files are stored in `public.files` with these metadata fields:
 
 ## rclone Flags
 
-The sync uses these efficient flags:
 - `--transfers 8`: 8 parallel file transfers
 - `--checkers 16`: 16 parallel file checkers
 - `--buffer-size 32M`: Larger buffer for big files
 - `--fast-list`: Use fewer API calls for listing
-- `--checksum`: Sync based on content hash (more reliable)
+- `--checksum`: Sync based on content hash
 
 ## Scripts
 
-### Run full metadata scan (no sync)
-
-Useful to populate metadata for existing files:
-
 ```bash
+# Full metadata scan (no rclone sync)
 docker exec file-metadata-sync python scripts/full_scan.py
-```
 
-### Run single sync cycle
-
-```bash
+# Single sync cycle
 docker exec file-metadata-sync python scripts/sync_once.py
 ```
 
 ## Troubleshooting
 
 ### "Storage object not found"
-
-The file was synced but storage.objects wasn't updated yet. Will retry on next cycle.
-
-### Permission errors
-
-Ensure the source folders are readable by the container (`:ro` mount should work).
+File synced but `storage.objects` not updated yet. Will retry next cycle.
 
 ### Connection errors
+- REST backend: Check `SUPABASE_URL` and `SUPABASE_SERVICE_KEY`
+- Postgres backend: Check `PG_DSN` and port 5432 access
 
-Check PG_DSN and S3 credentials. The app will retry connections automatically.
+### Permission errors
+Ensure source folders are readable (`:ro` mount should work).
 
 ## Environment Variables
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `PG_DSN` | Yes | - | PostgreSQL connection string |
-| `S3_ENDPOINT` | Yes | - | S3 endpoint URL |
-| `S3_ACCESS_KEY` | Yes | - | S3 access key |
-| `S3_SECRET_KEY` | Yes | - | S3 secret key |
-| `S3_BUCKET` | No | `files` | S3 bucket name |
-| `S3_REGION` | No | `eu-central-1` | S3 region |
-| `SYNC_SOURCE_PATHS` | Yes | - | Comma-separated paths to sync |
-| `SYNC_INTERVAL` | No | `900` | Seconds between syncs |
-| `LOG_LEVEL` | No | `INFO` | Logging level |
-| `BETTERSTACK_SOURCE_TOKEN` | No | - | BetterStack token |
-| `BETTERSTACK_INGEST_HOST` | No | - | BetterStack custom host |
-| `TIMEZONE` | No | `Europe/Berlin` | Timezone |
-
+| Variable | Backend | Required | Default | Description |
+|----------|---------|----------|---------|-------------|
+| `DB_BACKEND` | - | No | `rest` | `rest` or `postgres` |
+| `SUPABASE_URL` | rest | Yes | - | Supabase URL |
+| `SUPABASE_SERVICE_KEY` | rest | Yes | - | Service role key |
+| `PG_DSN` | postgres | Yes | - | PostgreSQL connection string |
+| `S3_ENDPOINT` | - | Yes | - | S3 endpoint URL |
+| `S3_ACCESS_KEY` | - | Yes | - | S3 access key |
+| `S3_SECRET_KEY` | - | Yes | - | S3 secret key |
+| `S3_BUCKET` | - | No | `files` | S3 bucket name |
+| `S3_REGION` | - | No | `eu-central-1` | S3 region |
+| `SYNC_SOURCE_PATHS` | - | Yes | - | Comma-separated container paths |
+| `SYNC_INTERVAL` | - | No | `900` | Seconds between syncs |
+| `LOG_LEVEL` | - | No | `INFO` | Logging level |
+| `BETTERSTACK_SOURCE_TOKEN` | - | No | - | BetterStack token |
+| `BETTERSTACK_INGEST_HOST` | - | No | - | BetterStack custom host |
+| `TIMEZONE` | - | No | `Europe/Berlin` | Timezone |

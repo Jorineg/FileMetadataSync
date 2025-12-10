@@ -19,3 +19,4 @@ rclone.conf
 # Test data
 test_data/
 
+.DS_Store

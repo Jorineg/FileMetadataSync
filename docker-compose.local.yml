@@ -1,6 +1,5 @@
 version: '3.8'
 
-
 # Local testing on Mac with Docker Desktop
 # Usage: docker-compose -f docker-compose.local.yml up --build
 
@@ -9,21 +8,28 @@ services:
     build: .
     container_name: file-metadata-sync-local
     environment:
+      # Database backend: "rest" (HTTPS/443) or "postgres" (direct/5432)
+      - DB_BACKEND=${DB_BACKEND:-rest}
+      # REST backend (DB_BACKEND=rest)
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      # Postgres backend (DB_BACKEND=postgres)
       - PG_DSN=${PG_DSN}
+      # S3 Storage
       - S3_ENDPOINT=${S3_ENDPOINT}
       - S3_ACCESS_KEY=${S3_ACCESS_KEY}
       - S3_SECRET_KEY=${S3_SECRET_KEY}
       - S3_BUCKET=${S3_BUCKET:-files}
       - S3_REGION=${S3_REGION:-eu-central-1}
-      - SYNC_SOURCE_PATHS=/data/test
+      # Sync settings
+      - SYNC_SOURCE_PATHS=${SYNC_SOURCE_PATHS:-/data/test}
       - SYNC_INTERVAL=${SYNC_INTERVAL:-60}
+      # Logging
       - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
       - BETTERSTACK_SOURCE_TOKEN=${BETTERSTACK_SOURCE_TOKEN}
       - BETTERSTACK_INGEST_HOST=${BETTERSTACK_INGEST_HOST}
       - TZ=${TIMEZONE:-Europe/Berlin}
     volumes:
-      # Mount a local test folder - adjust path as needed
       - ./test_data:/data/test:ro
       - ./data:/app/data
       - ./logs:/app/logs
-
