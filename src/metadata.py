@@ -73,14 +73,19 @@ def extract_metadata(filepath: Path, source_base_path: Path) -> dict:
     auto_metadata = {
         "mime_type": mime_type,
         "extension": filepath.suffix.lower() if filepath.suffix else None,
+        "original_filename": filepath.name,  # Preserve before sanitization
         "source_path": str(filepath),
         "source_base": str(source_base_path),
     }
 
-    # Relative path from source base
+    # Relative path from source base (include source folder name as root)
     try:
         rel_path = filepath.relative_to(source_base_path)
-        folder_path = str(rel_path.parent) if rel_path.parent != Path(".") else ""
+        # folder_path includes root folder: test/subfolder (not just subfolder)
+        if rel_path.parent != Path("."):
+            folder_path = f"{source_base_path.name}/{rel_path.parent}"
+        else:
+            folder_path = source_base_path.name
     except ValueError:
         folder_path = str(filepath.parent)
 

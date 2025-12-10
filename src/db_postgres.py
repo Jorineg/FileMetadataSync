@@ -150,6 +150,18 @@ class PostgresDatabase:
             ))
             return str(cur.fetchone()[0])
 
+    def get_all_file_hashes(self) -> dict[str, str]:
+        """
+        Fetch all existing file hashes from DB in one query.
+        Returns dict: {content_hash: storage_object_id}
+        """
+        with self.get_cursor() as cur:
+            cur.execute("SELECT content_hash, storage_object_id FROM files WHERE content_hash IS NOT NULL")
+            rows = cur.fetchall()
+            result = {row[0]: str(row[1]) for row in rows}
+            logger.info(f"Loaded {len(result)} existing file hashes from DB")
+            return result
+
     def close(self):
         if self._conn:
             try:

@@ -1,178 +1,155 @@
-"""File sync and metadata processing."""
-import subprocess
+"""File sync with hash-based skip logic for efficiency at scale."""
 import os
 from pathlib import Path
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src import settings
 from src.logging_conf import logger
 from src.db import Database
-from src.metadata import extract_metadata
-from src.rclone_parser import parse_stream, get_storage_path
+from src.metadata import extract_metadata, get_file_hash
+from src.storage_upload import StorageUploader, sanitize_path
 
 
-def build_rclone_config() -> str:
-    """Generate rclone config content for S3 remote."""
-    return f"""[supabase]
-type = s3
-provider = Other
-endpoint = {settings.S3_ENDPOINT}
-access_key_id = {settings.S3_ACCESS_KEY}
-secret_access_key = {settings.S3_SECRET_KEY}
-region = {settings.S3_REGION}
-acl = private
-"""
+def scan_filesystem(source_path: Path) -> list[Path]:
+    """Scan directory and return list of file paths (excludes hidden)."""
+    files = []
+    for root, dirs, filenames in os.walk(source_path):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        for filename in filenames:
+            if not filename.startswith('.'):
+                files.append(Path(root) / filename)
+    return files
 
 
-def run_rclone_sync(source_path: Path, bucket: str = None) -> subprocess.Popen:
-    """
-    Run rclone sync with efficient flags for many files.
-    Returns the subprocess for log parsing.
-    """
-    bucket = bucket or settings.S3_BUCKET
-
-    # Create temp rclone config
-    config_path = settings.DATA_DIR / "rclone.conf"
-    with open(config_path, "w") as f:
-        f.write(build_rclone_config())
-
-    # Destination path in S3 - use source folder name
-    dest_folder = source_path.name
-    dest = f"supabase:{bucket}/{dest_folder}"
-
-    cmd = [
-        "rclone", "sync",
-        str(source_path), dest,
-        "--config", str(config_path),
-        # Efficient flags for many files
-        "--transfers", "8",
-        "--checkers", "16",
-        "--buffer-size", "32M",
-        "--fast-list",
-        "--checksum",  # Use checksum instead of modtime for more reliable sync
-        # Progress and logging
-        "--progress",
-        "--stats", "10s",
-        "--stats-one-line",
-        "-v",  # Verbose to see file operations
-        "--log-format", "date,time",
-        # Don't modify times on S3 (not all S3 implementations support it)
-        "--no-update-modtime",
-    ]
-
-    logger.info(f"Starting rclone sync: {source_path} -> {dest}")
-    return subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,  # Combine stderr into stdout
-        text=True,
-        bufsize=1,  # Line buffered
-    )
+def compute_file_hashes(files: list[Path], max_workers: int = 4) -> dict[Path, str]:
+    """Compute hashes for all files in parallel. Returns {path: hash}."""
+    results = {}
+    
+    def hash_file(path: Path) -> tuple[Path, Optional[str]]:
+        return path, get_file_hash(path)
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(hash_file, f): f for f in files}
+        for future in as_completed(futures):
+            path, file_hash = future.result()
+            if file_hash:
+                results[path] = file_hash
+    
+    return results
 
 
-def process_synced_file(db: Database, local_path: Path, source_base: Path, bucket: str) -> bool:
-    """Process a synced file: extract metadata and upsert to DB."""
-    if not local_path.exists():
-        logger.warning(f"File not found (may have been deleted): {local_path}")
-        return False
-
-    if not local_path.is_file():
-        return False
-
-    # Get storage object path
-    storage_path = get_storage_path(str(local_path), source_base)
-    # Prepend source folder name to match rclone destination
-    storage_name = f"{source_base.name}/{storage_path}"
-
-    # Look up storage object ID
-    storage_object_id = db.get_storage_object_id(bucket, storage_name)
-    if not storage_object_id:
-        logger.warning(f"Storage object not found for {storage_name} - will retry later")
-        return False
-
-    # Extract metadata
-    metadata = extract_metadata(local_path, source_base)
-    metadata["storage_object_id"] = storage_object_id
-
-    # Upsert to database
+def process_single_file(
+    uploader: StorageUploader,
+    db: Database,
+    local_path: Path,
+    source_base: Path,
+    bucket: str
+) -> tuple[bool, str]:
+    """Upload file and update metadata. Returns (success, message)."""
     try:
+        rel_path = local_path.relative_to(source_base)
+        storage_path = f"{source_base.name}/{rel_path}"
+        
+        # Upload (returns sanitized path)
+        sanitized_path = uploader.upload_file(local_path, bucket, storage_path)
+        if not sanitized_path:
+            return False, f"Upload failed: {local_path.name}"
+        
+        # Get storage object ID
+        storage_object_id = db.get_storage_object_id(bucket, sanitized_path)
+        if not storage_object_id:
+            return False, f"Storage object not found: {sanitized_path}"
+        
+        # Extract and save metadata
+        metadata = extract_metadata(local_path, source_base)
+        metadata['storage_object_id'] = storage_object_id
+        
         file_id = db.upsert_file(metadata)
-        db.commit()
-        logger.info(f"Processed file: {local_path.name} -> {file_id}")
-        return True
+        if file_id:
+            db.commit()
+            return True, f"{local_path.name} -> {file_id}"
+        else:
+            db.rollback()
+            return False, f"DB insert failed: {local_path.name}"
+            
     except Exception as e:
-        db.rollback()
-        logger.error(f"Failed to upsert file {local_path}: {e}")
-        return False
+        return False, str(e)
 
 
 def sync_source(db: Database, source_path: Path) -> tuple[int, int]:
     """
-    Sync a source path and process all files.
-    Returns (processed_count, error_count).
+    Efficient sync with hash-based skip logic.
+    
+    Phase 1: Scan filesystem and compute hashes (parallel)
+    Phase 2: Compare with DB hashes (local, instant)
+    Phase 3: Upload only new/changed files (parallel)
     """
     bucket = settings.S3_BUCKET
+    
+    # Phase 1: Get existing hashes from DB (single query)
+    logger.info("Loading existing file hashes from database...")
+    existing_hashes = db.get_all_file_hashes()
+    existing_hash_set = set(existing_hashes.keys())
+    
+    # Phase 2: Scan filesystem
+    logger.info(f"Scanning directory: {source_path}")
+    all_files = scan_filesystem(source_path)
+    total_files = len(all_files)
+    logger.info(f"Found {total_files} files on disk")
+    
+    # Phase 3: Compute hashes (parallel, CPU-bound)
+    logger.info("Computing file hashes...")
+    local_hashes = compute_file_hashes(all_files, max_workers=os.cpu_count() or 4)
+    logger.info(f"Computed {len(local_hashes)} hashes")
+    
+    # Phase 4: Find files needing sync (new or changed hash)
+    files_to_sync = []
+    for path, file_hash in local_hashes.items():
+        if file_hash not in existing_hash_set:
+            files_to_sync.append(path)
+    
+    skipped = total_files - len(files_to_sync)
+    logger.info(f"Skipping {skipped} unchanged files, syncing {len(files_to_sync)} new/changed files")
+    
+    if not files_to_sync:
+        logger.info("No files to sync - all up to date")
+        return 0, 0
+    
+    # Phase 5: Upload changed files (parallel, I/O-bound)
+    uploader = StorageUploader()
+    if not uploader.ensure_bucket_exists(bucket):
+        logger.error(f"Failed to ensure bucket {bucket} exists")
+        return 0, 0
+    
     processed = 0
     errors = 0
-
-    # Run rclone sync
-    proc = run_rclone_sync(source_path, bucket)
-
-    # Parse output and process files
-    for line in iter(proc.stdout.readline, ''):
-        line = line.strip()
-        if not line:
-            continue
-
-        # Log all rclone output
-        logger.debug(f"rclone: {line}")
-
-        # Parse for copied files
-        from src.rclone_parser import parse_line
-        result = parse_line(line)
-        if result:
-            path, operation = result
-            if operation == "copied":
-                local_path = source_path / path
-                if process_synced_file(db, local_path, source_path, bucket):
+    max_workers = min(8, os.cpu_count() or 4)
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_file = {
+            executor.submit(process_single_file, uploader, db, f, source_path, bucket): f
+            for f in files_to_sync
+        }
+        
+        for i, future in enumerate(as_completed(future_to_file), 1):
+            file_path = future_to_file[future]
+            try:
+                success, message = future.result()
+                if success:
                     processed += 1
+                    logger.info(f"[{i}/{len(files_to_sync)}] {message}")
                 else:
                     errors += 1
-
-    # Wait for rclone to finish
-    proc.wait()
-    if proc.returncode != 0:
-        logger.error(f"rclone exited with code {proc.returncode}")
-
+                    logger.warning(f"[{i}/{len(files_to_sync)}] Error: {message}")
+            except Exception as e:
+                errors += 1
+                logger.error(f"[{i}/{len(files_to_sync)}] Exception: {e}")
+    
+    uploader.close()
     return processed, errors
 
 
 def full_scan_metadata(db: Database, source_path: Path) -> tuple[int, int]:
-    """
-    Scan all files in source path and update metadata in DB.
-    Use this for initial sync or to refresh all metadata.
-    Returns (processed_count, error_count).
-    """
-    bucket = settings.S3_BUCKET
-    processed = 0
-    errors = 0
-
-    logger.info(f"Starting full metadata scan: {source_path}")
-
-    for root, dirs, files in os.walk(source_path):
-        # Skip hidden directories
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
-
-        for filename in files:
-            if filename.startswith('.'):
-                continue
-
-            local_path = Path(root) / filename
-            if process_synced_file(db, local_path, source_path, bucket):
-                processed += 1
-            else:
-                errors += 1
-
-    logger.info(f"Full scan complete: {processed} processed, {errors} errors")
-    return processed, errors
-
+    """Alias for sync_source."""
+    return sync_source(db, source_path)

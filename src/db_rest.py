@@ -100,6 +100,34 @@ class RestDatabase:
             logger.error(f"Failed to upsert file: {e}")
             return None
 
+    def get_all_file_hashes(self) -> dict[str, str]:
+        """
+        Fetch all existing file hashes from DB in one query.
+        Returns dict: {content_hash: storage_object_id}
+        """
+        try:
+            # Paginate to handle large datasets
+            all_hashes = {}
+            page_size = 1000
+            offset = 0
+            
+            while True:
+                result = self._client.from_("files").select("content_hash,storage_object_id").range(offset, offset + page_size - 1).execute()
+                if not result.data:
+                    break
+                for row in result.data:
+                    if row.get("content_hash"):
+                        all_hashes[row["content_hash"]] = row["storage_object_id"]
+                if len(result.data) < page_size:
+                    break
+                offset += page_size
+            
+            logger.info(f"Loaded {len(all_hashes)} existing file hashes from DB")
+            return all_hashes
+        except Exception as e:
+            logger.error(f"Failed to fetch file hashes: {e}")
+            return {}
+
     def close(self):
         # REST client doesn't need explicit close
         logger.info("Supabase REST client closed")
