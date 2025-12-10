@@ -1,0 +1,21 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+
+# Logs
+logs/
+*.log
+
+# Data
+data/
+
+# Environment
+.env
+venv/
+
+# rclone config (contains secrets)
+rclone.conf
+
+# Test data
+test_data/
+
