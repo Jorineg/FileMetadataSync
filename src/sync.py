@@ -19,9 +19,12 @@ from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-from supabase import create_client
+from supabase import create_client, ClientOptions
 
 from src import settings
+
+# Timeout for uploads (large files need more time)
+UPLOAD_TIMEOUT = 300  # 5 minutes in seconds
 from src.logging_conf import logger
 
 
@@ -131,7 +134,11 @@ class FileWorker:
         self.existing_hashes = existing_hashes
         self.bucket = bucket
         self.source_base = source_base
-        self._client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
+        self._client = create_client(
+            settings.SUPABASE_URL,
+            settings.SUPABASE_SERVICE_KEY,
+            options=ClientOptions(postgrest_client_timeout=UPLOAD_TIMEOUT, storage_client_timeout=UPLOAD_TIMEOUT)
+        )
 
     def process_file(self, filepath: Path) -> tuple[str, bool, str, Optional[datetime]]:
         """
@@ -319,29 +326,11 @@ def sync_source(source_path: Path, max_workers: int = DEFAULT_WORKERS) -> SyncSt
 
 
 def upsert_checkpoint(last_event_time: Optional[datetime]) -> None:
-    """Upsert checkpoint to DB. Only updates last_event_time if provided."""
+    """Upsert checkpoint to DB via RPC. Only updates last_event_time if provided."""
     client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
     try:
-        now = datetime.now(timezone.utc).isoformat()
-        if last_event_time:
-            # New files uploaded, update both timestamps
-            client.from_("teamworkmissiveconnector.checkpoints").upsert({
-                "source": "files",
-                "last_event_time": last_event_time.isoformat(),
-                "updated_at": now
-            }, on_conflict="source").execute()
-        else:
-            # No new files, only update updated_at (keep old last_event_time)
-            result = client.from_("teamworkmissiveconnector.checkpoints").select("source").eq("source", "files").execute()
-            if result.data:
-                client.from_("teamworkmissiveconnector.checkpoints").update({"updated_at": now}).eq("source", "files").execute()
-            else:
-                # First run with no files - insert with epoch as placeholder
-                client.from_("teamworkmissiveconnector.checkpoints").insert({
-                    "source": "files",
-                    "last_event_time": datetime(1970, 1, 1, tzinfo=timezone.utc).isoformat(),
-                    "updated_at": now
-                }).execute()
+        params = {"p_last_event_time": last_event_time.isoformat() if last_event_time else None}
+        client.rpc("upsert_files_checkpoint", params).execute()
         logger.debug("Checkpoint saved for 'files'")
     except Exception as e:
         logger.warning(f"Failed to save checkpoint: {e}")
