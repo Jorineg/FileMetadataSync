@@ -39,6 +39,7 @@ class SyncStats:
     errors: int = 0
     start_time: float = 0
     end_time: float = 0
+    last_file_modified_at: Optional[datetime] = None
 
     @property
     def duration_seconds(self) -> float:
@@ -132,26 +133,26 @@ class FileWorker:
         self.source_base = source_base
         self._client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
 
-    def process_file(self, filepath: Path) -> tuple[str, bool, str]:
+    def process_file(self, filepath: Path) -> tuple[str, bool, str, Optional[datetime]]:
         """
         Process a single file: hash → compare → upload → insert.
-        Returns: (filename, success, message)
+        Returns: (filename, success, message, file_modified_at if uploaded)
         """
         filename = filepath.name
 
         # Step 1: Compute hash (streaming, memory-efficient)
         content_hash = compute_hash_streaming(filepath)
         if not content_hash:
-            return filename, False, "hash failed"
+            return filename, False, "hash failed", None
 
         # Step 2: Check if unchanged
         if content_hash in self.existing_hashes:
-            return filename, True, "unchanged"
+            return filename, True, "unchanged", None
 
         # Step 3: Extract metadata (stat only, no file read)
         metadata = extract_file_metadata(filepath, self.source_base)
         if not metadata:
-            return filename, False, "metadata extraction failed"
+            return filename, False, "metadata extraction failed", None
 
         # Step 4: Generate UUID for storage path
         storage_uuid = str(uuid.uuid4())
@@ -173,7 +174,7 @@ class FileWorker:
                 file_options={"content-type": content_type}
             )
         except Exception as e:
-            return filename, False, f"upload failed: {e}"
+            return filename, False, f"upload failed: {e}", None
 
         # Step 6: Insert to DB
         db_record = {
@@ -194,9 +195,11 @@ class FileWorker:
                 logger.debug(f"Cleaned up orphan: {storage_path}")
             except Exception as cleanup_error:
                 logger.warning(f"Failed to cleanup orphan {storage_path}: {cleanup_error}")
-            return filename, False, f"db insert failed: {e}"
+            return filename, False, f"db insert failed: {e}", None
 
-        return filename, True, f"uploaded → {file_id}"
+        # Parse the file_modified_at back to datetime for tracking
+        file_modified_at = datetime.fromisoformat(metadata["file_modified_at"].replace("Z", "+00:00"))
+        return filename, True, f"uploaded → {file_id}", file_modified_at
 
 
 def scan_filesystem(source_path: Path) -> list[Path]:
@@ -240,6 +243,7 @@ def sync_source(source_path: Path, max_workers: int = DEFAULT_WORKERS) -> SyncSt
     stats = SyncStats()
     stats.start_time = time.time()
     bucket = settings.S3_BUCKET
+    max_file_modified: Optional[datetime] = None
 
     # Phase 1: Load existing hashes from DB
     logger.info("Loading existing hashes from database...")
@@ -272,7 +276,7 @@ def sync_source(source_path: Path, max_workers: int = DEFAULT_WORKERS) -> SyncSt
     # Phase 3: Process files with worker pool
     logger.info(f"Processing files with {max_workers} workers...")
 
-    def process_with_worker(filepath: Path) -> tuple[str, bool, str]:
+    def process_with_worker(filepath: Path) -> tuple[str, bool, str, Optional[datetime]]:
         # Each call creates worker with own client (thread-safe)
         worker = FileWorker(existing_hashes, bucket, source_path)
         return worker.process_file(filepath)
@@ -283,7 +287,7 @@ def sync_source(source_path: Path, max_workers: int = DEFAULT_WORKERS) -> SyncSt
         for i, future in enumerate(as_completed(future_to_file), 1):
             filepath = future_to_file[future]
             try:
-                filename, success, message = future.result()
+                filename, success, message, file_modified_at = future.result()
                 
                 if success:
                     if message == "unchanged":
@@ -293,6 +297,9 @@ def sync_source(source_path: Path, max_workers: int = DEFAULT_WORKERS) -> SyncSt
                     else:
                         stats.uploaded += 1
                         logger.info(f"[{i}/{stats.total_files}] {filename}: {message}")
+                        # Track max file_modified_at
+                        if file_modified_at and (max_file_modified is None or file_modified_at > max_file_modified):
+                            max_file_modified = file_modified_at
                 else:
                     stats.errors += 1
                     logger.warning(f"[{i}/{stats.total_files}] {filename}: {message}")
@@ -307,7 +314,37 @@ def sync_source(source_path: Path, max_workers: int = DEFAULT_WORKERS) -> SyncSt
                 logger.info(f"Progress: {pct:.0f}% ({i}/{stats.total_files})")
 
     stats.end_time = time.time()
+    stats.last_file_modified_at = max_file_modified
     return stats
+
+
+def upsert_checkpoint(last_event_time: Optional[datetime]) -> None:
+    """Upsert checkpoint to DB. Only updates last_event_time if provided."""
+    client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        if last_event_time:
+            # New files uploaded, update both timestamps
+            client.from_("teamworkmissiveconnector.checkpoints").upsert({
+                "source": "files",
+                "last_event_time": last_event_time.isoformat(),
+                "updated_at": now
+            }, on_conflict="source").execute()
+        else:
+            # No new files, only update updated_at (keep old last_event_time)
+            result = client.from_("teamworkmissiveconnector.checkpoints").select("source").eq("source", "files").execute()
+            if result.data:
+                client.from_("teamworkmissiveconnector.checkpoints").update({"updated_at": now}).eq("source", "files").execute()
+            else:
+                # First run with no files - insert with epoch as placeholder
+                client.from_("teamworkmissiveconnector.checkpoints").insert({
+                    "source": "files",
+                    "last_event_time": datetime(1970, 1, 1, tzinfo=timezone.utc).isoformat(),
+                    "updated_at": now
+                }).execute()
+        logger.debug("Checkpoint saved for 'files'")
+    except Exception as e:
+        logger.warning(f"Failed to save checkpoint: {e}")
 
 
 def run_sync_cycle(source_paths: list[str], max_workers: int = DEFAULT_WORKERS) -> tuple[int, int, float]:
@@ -318,6 +355,7 @@ def run_sync_cycle(source_paths: list[str], max_workers: int = DEFAULT_WORKERS) 
     total_uploaded = 0
     total_errors = 0
     start_time = time.time()
+    max_file_modified: Optional[datetime] = None
 
     for source_path_str in source_paths:
         source_path = Path(source_path_str)
@@ -330,12 +368,20 @@ def run_sync_cycle(source_paths: list[str], max_workers: int = DEFAULT_WORKERS) 
         
         total_uploaded += stats.uploaded
         total_errors += stats.errors
+        
+        # Track max file_modified_at across all sources
+        if stats.last_file_modified_at:
+            if max_file_modified is None or stats.last_file_modified_at > max_file_modified:
+                max_file_modified = stats.last_file_modified_at
 
         logger.info(
             f"Source {source_path.name} complete: "
             f"{stats.uploaded} uploaded, {stats.skipped_unchanged} unchanged, "
             f"{stats.errors} errors in {stats.duration_human}"
         )
+
+    # Save checkpoint at end of sync cycle
+    upsert_checkpoint(max_file_modified)
 
     duration = time.time() - start_time
     return total_uploaded, total_errors, duration

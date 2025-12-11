@@ -16,6 +16,6 @@ services:
       - BETTERSTACK_INGEST_HOST=${BETTERSTACK_INGEST_HOST}
       - TIMEZONE=${TIMEZONE:-Europe/Berlin}
     volumes:
-      - ../../:/data/test:ro
+      - ./test_data:/data/test:ro
       - ./logs:/app/logs
     restart: unless-stopped
