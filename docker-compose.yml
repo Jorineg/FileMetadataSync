@@ -24,6 +24,8 @@ services:
       #   - /volume1/images:/data/images:ro
       # Or mount a single parent:
       #   - /volume1/files:/data:ro
-      - /volume1/email_attachments:/data/email_attachments:ro
-      - ./logs:/app/logs
+      # - /volume1/email_attachments:/data/email_attachments:ro
+      # - ./logs:/app/logs
+      - ./test_data:/data/test_data:ro
+      - ../.cursor:/data/.cursor:ro
     restart: unless-stopped
