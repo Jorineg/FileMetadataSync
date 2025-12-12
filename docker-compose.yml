@@ -8,16 +8,22 @@ services:
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - S3_BUCKET=${S3_BUCKET:-files}
-      - SYNC_SOURCE_PATHS=${SYNC_SOURCE_PATHS}
-      - SYNC_INTERVAL=${SYNC_INTERVAL:-900}
       - SYNC_WORKERS=${SYNC_WORKERS:-6}
+      - DEBOUNCE_SECONDS=${DEBOUNCE_SECONDS:-3.0}
+      - IGNORE_PATTERNS=${IGNORE_PATTERNS:-}
+      - FULL_SCAN_HOUR=${FULL_SCAN_HOUR:-3}
+      - FULL_SCAN_ON_STARTUP=${FULL_SCAN_ON_STARTUP:-true}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - BETTERSTACK_SOURCE_TOKEN=${BETTERSTACK_SOURCE_TOKEN}
       - BETTERSTACK_INGEST_HOST=${BETTERSTACK_INGEST_HOST}
       - TIMEZONE=${TIMEZONE:-Europe/Berlin}
     volumes:
-      # Map your NAS data directories here
-      # Example: - /volume1/data:/data:ro
-      - ${HOST_DATA_PATH}:/data:ro
+      # Mount your directories to /data - everything under /data is scanned
+      # Examples:
+      #   - /volume1/documents:/data/documents:ro
+      #   - /volume1/images:/data/images:ro
+      # Or mount a single parent:
+      #   - /volume1/files:/data:ro
+      - /volume1/email_attachments:/data/email_attachments:ro
       - ./logs:/app/logs
     restart: unless-stopped

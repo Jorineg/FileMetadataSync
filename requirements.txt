@@ -1,3 +1,4 @@
 python-dotenv==1.0.0
 logtail-python==0.2.8
 supabase>=2.11.0
+watchdog>=4.0.0

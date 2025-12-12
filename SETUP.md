@@ -4,71 +4,85 @@ Syncs files from local directories to Supabase Storage with metadata tracking.
 
 ## Architecture
 
-- **UUID-based storage paths**: Files are stored with UUID names, original filenames preserved in metadata
-- **Single-phase workers**: Each worker handles hash → compare → upload → insert (no waiting)
+**Hybrid mode: real-time watcher + daily full scan**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    FileMetadataSync                         │
+├─────────────────────────────────────────────────────────────┤
+│  ┌──────────────────┐         ┌──────────────────────────┐  │
+│  │  Watcher Thread  │         │    Daily Full Scan       │  │
+│  │                  │         │    (scheduled hour)      │  │
+│  │  - create        │         │                          │  │
+│  │  - modify        │         │  - Catch missed events   │  │
+│  │  - move/rename   │         │  - Soft-delete orphans   │  │
+│  │                  │         │  - Update moved paths    │  │
+│  └────────┬─────────┘         └───────────┬──────────────┘  │
+│           └───────────┬───────────────────┘                 │
+│                       ▼                                     │
+│           ┌───────────────────────┐                         │
+│           │   In-memory Queue     │                         │
+│           │   + Debounce          │                         │
+│           └───────────┬───────────┘                         │
+│                       ▼                                     │
+│           ┌───────────────────────┐                         │
+│           │   Worker Pool         │                         │
+│           │   hash → upload → DB  │                         │
+│           └───────────────────────┘                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key features:**
+- **Real-time**: Watcher detects file changes instantly (using inotify on Linux, FSEvents on macOS)
+- **Self-contained**: No external cron jobs needed - scheduler runs inside the container
+- **Resilient**: Daily full scan catches anything missed by the watcher
+- **Soft-delete**: Files removed from filesystem are marked `deleted_at` (not hard-deleted)
 - **Thread-safe**: Each worker has its own Supabase client
-- **Self-healing**: Failed files retry automatically on next sync cycle
 - **Compensating transactions**: If DB insert fails, file is deleted from storage (no orphans)
 
 ## Requirements
 
 - Docker
 - Supabase project with:
-  - `files` table (see schema below)
+  - `files` table (managed by ibhelmDB schema)
   - Storage bucket named `files` (or configure via `S3_BUCKET`)
-
-## Database Schema
-
-Run this SQL in your Supabase SQL editor:
-
-```sql
-CREATE TABLE IF NOT EXISTS public.files (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    storage_path TEXT UNIQUE NOT NULL,  -- UUID-based path in storage
-    content_hash TEXT NOT NULL,         -- SHA256 for change detection
-    filename TEXT NOT NULL,             -- Original filename
-    folder_path TEXT,                   -- Original folder path
-    file_created_at TIMESTAMPTZ,
-    file_modified_at TIMESTAMPTZ,
-    filesystem_attributes JSONB,
-    auto_extracted_metadata JSONB,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Index for hash lookups (critical for performance)
-CREATE INDEX IF NOT EXISTS idx_files_content_hash ON public.files(content_hash);
-
--- Index for folder queries
-CREATE INDEX IF NOT EXISTS idx_files_folder_path ON public.files(folder_path);
-```
 
 ## Configuration
 
-Create `.env` file:
+Create `.env` file from example:
 
-```env
-# Supabase (required)
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_KEY=your-service-role-key
+```bash
+cp env.example .env
+```
 
-# Storage bucket (default: files)
-S3_BUCKET=files
+### Required Settings
 
-# Source paths (container-internal paths, comma-separated)
-SYNC_SOURCE_PATHS=/data/documents,/data/images
+| Variable | Description |
+|----------|-------------|
+| `SUPABASE_URL` | Your Supabase project URL |
+| `SUPABASE_SERVICE_KEY` | Service role key (has write access) |
 
-# Sync interval in seconds (default: 900 = 15 minutes)
-SYNC_INTERVAL=900
+**That's it!** Mount your directories to `/data` in docker-compose and they're automatically scanned.
 
-# Worker threads (default: 6, adjust for your hardware)
-# Synology DS923+: 4-6 recommended
-SYNC_WORKERS=6
+### Optional Settings
 
-# Logging (optional)
-LOG_LEVEL=INFO
-BETTERSTACK_SOURCE_TOKEN=
-BETTERSTACK_INGEST_HOST=
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3_BUCKET` | `files` | Storage bucket name |
+| `SYNC_WORKERS` | `6` | Number of worker threads |
+| `DEBOUNCE_SECONDS` | `3.0` | Wait time before processing events |
+| `FULL_SCAN_HOUR` | `3` | Hour (0-23) for daily full scan |
+| `FULL_SCAN_ON_STARTUP` | `true` | Run full scan when container starts |
+| `IGNORE_PATTERNS` | (see below) | Patterns to ignore |
+| `LOG_LEVEL` | `INFO` | Logging level |
+| `TIMEZONE` | `Europe/Berlin` | Timezone for scheduling |
+| `SYNC_SOURCE_PATHS` | `/data` | Override scan paths (advanced) |
+
+### Default Ignore Patterns
+
+```
+*.tmp, *.temp, .DS_Store, Thumbs.db, *.partial,
+.syncing, @eaDir/*, #recycle/*, .SynologyWorkingDirectory/*
 ```
 
 ## Local Testing (Mac/Linux)
@@ -86,20 +100,46 @@ cp env.example .env
 docker compose -f docker-compose.local.yml up --build
 ```
 
-## Synology NAS Deployment
-
-1. Copy project to NAS
-2. Create `.env` with your config
-3. Edit `docker-compose.yml` to map your data directories:
-
-```yaml
-volumes:
-  - /volume1/documents:/data/documents:ro
-  - /volume1/images:/data/images:ro
+**Test the watcher:**
+```bash
+# In another terminal, create/modify files
+echo "new file" > test_data/newfile.txt
+echo "modified" >> test_data/test.txt
+mv test_data/test.txt test_data/renamed.txt
 ```
 
-4. Deploy:
+Watch the logs - you should see events processed within a few seconds.
 
+## Synology NAS Deployment
+
+1. Copy project to NAS (e.g., via SSH or Synology Drive)
+
+2. Create `.env` with your credentials:
+```env
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_KEY=your-service-key
+```
+
+3. Edit `docker-compose.yml` - just mount your directories to `/data`:
+```yaml
+volumes:
+  # Everything under /data is automatically scanned
+  - /volume1/documents:/data/documents:ro
+  - /volume1/images:/data/images:ro
+  # Or mount a single parent folder:
+  # - /volume1/files:/data:ro
+```
+
+4. (Optional) Increase inotify watch limit if you have many directories:
+```bash
+# Check current limit
+cat /proc/sys/fs/inotify/max_user_watches
+
+# Increase if needed (default 8192 may not be enough)
+echo 524288 | sudo tee /proc/sys/fs/inotify/max_user_watches
+```
+
+5. Deploy:
 ```bash
 docker compose up -d
 ```
@@ -112,13 +152,14 @@ docker compose up -d
 | DS1621+ (6 threads) | 6-8 | ~4-5 files/sec |
 | DS1821+ (8 threads) | 8-12 | ~6-8 files/sec |
 
-### Sync Time Estimates (100k files, 100GB)
+### Disk I/O Comparison
 
-| Scenario | 1GbE | 10GbE |
-|----------|------|-------|
-| Initial sync | 15-20 min | 8-12 min |
-| Typical sync (1% changed) | 2-3 min | 1-2 min |
-| Typical sync (0.1% changed) | 30-60 sec | 30 sec |
+| Mode | Daily Disk Reads (100GB dataset) |
+|------|----------------------------------|
+| Old (polling every 15 min) | ~4.8 TB/day |
+| New (watcher + 1 daily scan) | ~100 GB/day |
+
+**~50x reduction in disk I/O** - much gentler on NAS HDDs.
 
 ## Monitoring
 
@@ -127,9 +168,24 @@ Logs are written to:
 - `./logs/app.log`
 - Betterstack (if configured)
 
-Log format:
+### Log Examples
+
 ```
-2024-01-15 10:30:45 [INFO] file_metadata_sync: Sync complete: 150 uploaded, 0 errors in 2.5m
+FileMetadataSync starting (hybrid mode)
+Source paths: ['/data/documents', '/data/images']
+Full scan hour: 3:00
+Full scan on startup: True
+Watching: /data/documents
+Watching: /data/images
+Watcher started with 2 paths, debounce=3.0s
+
+# Real-time events
+Event: created /data/documents/report.pdf
+Watcher batch: 1 uploaded, 0 updated, 0 unchanged, 0 errors
+
+# Daily scan
+Starting full scan (scheduled)...
+Full scan complete: 5 uploaded, 12 updated, 9983 unchanged, 3 soft-deleted, 0 errors in 2.5m
 ```
 
 ## Troubleshooting
@@ -140,8 +196,14 @@ Ensure `.env` file exists and contains valid credentials.
 ### "Failed to upload"
 Check Supabase Storage bucket exists and service key has write permissions.
 
+### Watcher not detecting changes
+- Check `IGNORE_PATTERNS` isn't excluding your files
+- Verify inotify watch limit: `cat /proc/sys/fs/inotify/max_user_watches`
+- Check logs for "Watching:" messages
+
 ### High memory usage
 Reduce `SYNC_WORKERS` to limit concurrent file processing.
 
-### Slow sync
-Increase `SYNC_WORKERS` if CPU/network are not saturated.
+### Files not syncing on NAS
+- Ensure volumes are mounted with `:ro` (read-only is fine for sync)
+- Check Synology Drive isn't creating temp files that match ignore patterns
