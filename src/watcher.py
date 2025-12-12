@@ -2,10 +2,11 @@
 Filesystem watcher with debouncing for real-time file sync.
 Uses watchdog (cross-platform: inotify on Linux, FSEvents on macOS).
 """
+
 import fnmatch
+import os
 import threading
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from watchdog.observers import Observer
+from watchdog.observers.polling import PollingObserver
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 
 from src import settings
@@ -94,8 +96,16 @@ class SyncEventHandler(FileSystemEventHandler):
         return Path(path).is_file()
 
     def on_created(self, event: FileSystemEvent) -> None:
-        if event.is_directory or self._should_ignore(event.src_path):
+        if self._should_ignore(event.src_path):
             return
+        
+        if event.is_directory:
+            # Directory created - scan for files inside (handles copy/move of folders with contents)
+            # Short sleep to allow filesystem to settle/files to appear if it's a copy operation
+            time.sleep(1.0)
+            self._scan_new_directory(Path(event.src_path))
+            return
+        
         # Wait a moment for file to be fully written
         if not self._is_file(event.src_path):
             return
@@ -105,6 +115,27 @@ class SyncEventHandler(FileSystemEventHandler):
             timestamp=time.time()
         ))
         logger.debug(f"Event: created {event.src_path}")
+
+    def _scan_new_directory(self, dir_path: Path) -> None:
+        """Scan a newly created directory and queue all files inside."""
+        try:
+            for root, dirs, files in os.walk(dir_path):
+                # Filter out hidden directories
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                for filename in files:
+                    filepath = Path(root) / filename
+                    if self._should_ignore(str(filepath)):
+                        continue
+                    if not filepath.is_file():
+                        continue
+                    self.queue.add(PendingEvent(
+                        path=filepath,
+                        event_type=EventType.CREATED,
+                        timestamp=time.time()
+                    ))
+                    logger.debug(f"Event: created (from dir scan) {filepath}")
+        except Exception as e:
+            logger.warning(f"Failed to scan new directory {dir_path}: {e}")
 
     def on_modified(self, event: FileSystemEvent) -> None:
         if event.is_directory or self._should_ignore(event.src_path):
@@ -119,14 +150,18 @@ class SyncEventHandler(FileSystemEventHandler):
         logger.debug(f"Event: modified {event.src_path}")
 
     def on_moved(self, event: FileSystemEvent) -> None:
-        if event.is_directory:
-            return
-        # Handle source being ignored (file moved into watched area)
-        src_ignored = self._should_ignore(event.src_path)
         dest_ignored = self._should_ignore(event.dest_path)
-        
         if dest_ignored:
             return  # Moved to ignored location, ignore
+        
+        if event.is_directory:
+            # Directory moved - scan for files inside
+            self._scan_new_directory(Path(event.dest_path))
+            logger.debug(f"Event: directory moved {event.src_path} → {event.dest_path}")
+            return
+        
+        # Handle source being ignored (file moved into watched area)
+        src_ignored = self._should_ignore(event.src_path)
         
         if src_ignored:
             # Moved from ignored to watched = treat as created
@@ -160,7 +195,11 @@ class FileWatcher:
         self.on_events_ready = on_events_ready
         self.queue = EventQueue(debounce_seconds=debounce_seconds)
         self.ignore_patterns = ignore_patterns or settings.IGNORE_PATTERNS
-        self.observer = Observer()
+        
+        # Use PollingObserver for better compatibility with Docker volumes and network shares
+        # It's more CPU intensive but reliably detects changes where inotify/FSEvents fail
+        self.observer = PollingObserver()
+        
         self._processor_thread: threading.Thread | None = None
         self._running = False
 
