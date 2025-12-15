@@ -260,10 +260,11 @@ def handle_move_event(src_path: Path, dest_path: Path, source_base: Path, client
 
 
 def scan_filesystem(source_path: Path) -> list[Path]:
-    """Scan directory and return list of file paths (excludes hidden)."""
+    """Scan directory and return list of file paths (excludes hidden and system dirs)."""
     files = []
+    skip_dirs = {'.', '@eaDir', '#recycle', '.SynologyWorkingDirectory'}
     for root, dirs, filenames in os.walk(source_path):
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in skip_dirs]
         for filename in filenames:
             if not filename.startswith('.'):
                 files.append(Path(root) / filename)
