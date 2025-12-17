@@ -344,18 +344,24 @@ def run_full_scan(source_paths: list[str], max_workers: int = DEFAULT_WORKERS) -
                 if i % max(1, stats.total_files // 10) == 0:
                     logger.info(f"Full scan progress: {i*100//stats.total_files}%")
 
-    # Soft-delete files not seen during this scan
+    # Soft-delete files not seen during this scan (scoped to this instance's source paths)
     logger.info("Full scan: Checking for deleted files...")
-    try:
-        result = client.from_("files").update({
-            "deleted_at": scan_start.isoformat()
-        }).lt("last_seen_at", scan_start.isoformat()).is_("deleted_at", "null").execute()
-        
-        if result.data:
-            stats.soft_deleted = len(result.data)
-            logger.info(f"Full scan: Soft-deleted {stats.soft_deleted} files no longer on filesystem")
-    except Exception as e:
-        logger.error(f"Failed to soft-delete orphan files: {e}")
+    for source_path_str in source_paths:
+        try:
+            result = client.from_("files").update({
+                "deleted_at": scan_start.isoformat()
+            }).lt("last_seen_at", scan_start.isoformat()) \
+              .is_("deleted_at", "null") \
+              .eq("auto_extracted_metadata->>source_base", source_path_str) \
+              .execute()
+            
+            if result.data:
+                stats.soft_deleted += len(result.data)
+        except Exception as e:
+            logger.error(f"Failed to soft-delete orphan files for {source_path_str}: {e}")
+    
+    if stats.soft_deleted > 0:
+        logger.info(f"Full scan: Soft-deleted {stats.soft_deleted} files no longer on filesystem")
 
     stats.end_time = time.time()
     return stats
