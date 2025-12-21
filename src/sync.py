@@ -117,9 +117,15 @@ def get_supabase_client():
     )
 
 
-def fetch_existing_files(client) -> dict[str, dict]:
-    """Fetch all existing files from DB. Returns {content_hash: {id, filename, folder_path}}."""
-    all_files = {}
+def fetch_existing_files(client) -> tuple[dict[str, dict], dict[tuple[str, str], dict]]:
+    """
+    Fetch all existing files from DB.
+    Returns: (hash_map, path_map)
+    hash_map: {content_hash: {id, filename, folder_path}}
+    path_map: {(folder_path, filename): {id, content_hash}}
+    """
+    hash_map = {}
+    path_map = {}
     page_size = 1000
     offset = 0
 
@@ -128,26 +134,38 @@ def fetch_existing_files(client) -> dict[str, dict]:
         if not result.data:
             break
         for row in result.data:
-            if row.get("content_hash"):
-                all_files[row["content_hash"]] = {
+            f_path = row.get("folder_path")
+            f_name = row.get("filename")
+            f_hash = row.get("content_hash")
+            
+            # Map by hash (for moved files)
+            if f_hash:
+                hash_map[f_hash] = {
                     "id": row["id"],
-                    "filename": row.get("filename"),
-                    "folder_path": row.get("folder_path")
+                    "filename": f_name,
+                    "folder_path": f_path
                 }
+            
+            # Map by path (for same-path duplicates/updates)
+            if f_name:
+                path_map[(f_path, f_name)] = {
+                    "id": row["id"],
+                    "content_hash": f_hash
+                }
+                
         if len(result.data) < page_size:
             break
         offset += page_size
 
-    return all_files
+    return hash_map, path_map
 
 
-def process_single_file(filepath: Path, source_base: Path, existing_files: dict, bucket: str, client) -> tuple[str, str, str]:
+def process_single_file(filepath: Path, source_base: Path, hash_map: dict, path_map: dict, bucket: str, client) -> tuple[str, str, str]:
     """
-    Process a single file: hash → compare → upload/update.
-    Returns: (filename, action, message)
-    action: "uploaded", "updated", "unchanged", "error"
+    Process a single file: hash → compare → upload/update using UPSERT.
     """
     filename = filepath.name
+    now = datetime.now(timezone.utc).isoformat()
 
     content_hash = compute_hash_streaming(filepath)
     if not content_hash:
@@ -157,69 +175,72 @@ def process_single_file(filepath: Path, source_base: Path, existing_files: dict,
     if not metadata:
         return filename, "error", "metadata extraction failed"
 
-    existing = existing_files.get(content_hash)
-    now = datetime.now(timezone.utc).isoformat()
+    folder_path = metadata["folder_path"]
+    path_key = (folder_path, filename)
 
-    if existing:
-        # File exists - check if path changed
-        if existing["filename"] != metadata["filename"] or existing["folder_path"] != metadata["folder_path"]:
+    # 1. Check if the exact PATH exists (Same Path Check)
+    existing_path = path_map.get(path_key)
+    if existing_path:
+        if existing_path["content_hash"] == content_hash:
+            # Hash matches path - just update last_seen_at
             try:
-                client.from_("files").update({
-                    "filename": metadata["filename"],
-                    "folder_path": metadata["folder_path"],
-                    "auto_extracted_metadata": metadata["auto_extracted_metadata"],
-                    "last_seen_at": now,
-                    "deleted_at": None,  # Resurrect if was soft-deleted
-                    "db_updated_at": now,
-                }).eq("id", existing["id"]).execute()
-                return filename, "updated", f"path updated → {existing['id']}"
+                client.from_("files").update({"last_seen_at": now}).eq("id", existing_path["id"]).execute()
+                return filename, "unchanged", "unchanged"
             except Exception as e:
-                return filename, "error", f"update failed: {e}"
+                logger.warning(f"Failed to update last_seen_at for {existing_path['id']}: {e}")
+                return filename, "unchanged", "last_seen_at update failed"
         else:
-            # Just update last_seen_at
-            try:
-                client.from_("files").update({"last_seen_at": now}).eq("id", existing["id"]).execute()
-            except Exception as e:
-                logger.warning(f"Failed to update last_seen_at for {existing['id']}: {e}")
-            return filename, "unchanged", "unchanged"
+            # Path exists but content changed - we need to upload
+            pass
 
-    # New file - upload
-    storage_uuid = str(uuid.uuid4())
-    extension = filepath.suffix.lower() if filepath.suffix else ""
-    storage_path = f"{storage_uuid}{extension}"
+    storage_path = None
+    
+    # NEW or UPDATED file - upload
+    if not storage_path:
+        storage_uuid = str(uuid.uuid4())
+        extension = filepath.suffix.lower() if filepath.suffix else ""
+        storage_path = f"{storage_uuid}{extension}"
 
-    try:
-        with open(filepath, 'rb') as f:
-            file_data = f.read()
-        content_type, _ = mimetypes.guess_type(str(filepath))
-        client.storage.from_(bucket).upload(
-            storage_path, file_data,
-            file_options={"content-type": content_type or "application/octet-stream"}
-        )
-    except Exception as e:
-        return filename, "error", f"upload failed: {e}"
+        try:
+            with open(filepath, 'rb') as f:
+                file_data = f.read()
+            content_type, _ = mimetypes.guess_type(str(filepath))
+            client.storage.from_(bucket).upload(
+                storage_path, file_data,
+                file_options={"content-type": content_type or "application/octet-stream"}
+            )
+        except Exception as e:
+            return filename, "error", f"upload failed: {e}"
 
     db_record = {
         "storage_path": storage_path,
         "content_hash": content_hash,
         "last_seen_at": now,
+        "deleted_at": None,
+        "db_updated_at": now,
         **metadata,
     }
 
     try:
-        result = client.from_("files").insert(db_record).execute()
+        # Use upsert with on_conflict on (folder_path, filename)
+        result = client.from_("files").upsert(db_record, on_conflict="folder_path,filename").execute()
         if not result.data:
-            raise Exception("No data returned")
+            raise Exception("Upsert returned no data")
         file_id = result.data[0].get("id", "unknown")
-        existing_files[content_hash] = {"id": file_id, "filename": metadata["filename"], "folder_path": metadata["folder_path"]}
-        return filename, "uploaded", f"uploaded → {file_id}"
+        
+        # Update local maps
+        hash_map[content_hash] = {"id": file_id, "filename": filename, "folder_path": folder_path}
+        path_map[path_key] = {"id": file_id, "content_hash": content_hash}
+        
+        return filename, "uploaded", f"upserted → {file_id}"
     except Exception as e:
-        # Compensating transaction
-        try:
-            client.storage.from_(bucket).remove([storage_path])
-        except Exception:
-            pass
-        return filename, "error", f"db insert failed: {e}"
+        # Cleanup storage if it was a brand new path
+        if not existing_path:
+            try:
+                client.storage.from_(bucket).remove([storage_path])
+            except Exception:
+                pass
+        return filename, "error", f"db upsert failed: {e}"
 
 
 def handle_move_event(src_path: Path, dest_path: Path, source_base: Path, client) -> tuple[str, str]:
@@ -239,24 +260,29 @@ def handle_move_event(src_path: Path, dest_path: Path, source_base: Path, client
     now = datetime.now(timezone.utc).isoformat()
 
     # Find existing file by hash
-    result = client.from_("files").select("id").eq("content_hash", content_hash).limit(1).execute()
-    
-    if result.data:
-        file_id = result.data[0]["id"]
-        try:
-            client.from_("files").update({
-                "filename": metadata["filename"],
-                "folder_path": metadata["folder_path"],
-                "auto_extracted_metadata": metadata["auto_extracted_metadata"],
-                "last_seen_at": now,
-                "deleted_at": None,
-                "db_updated_at": now,
-            }).eq("id", file_id).execute()
-            return "updated", f"moved → {file_id}"
-        except Exception as e:
-            return "error", f"update failed: {e}"
-    else:
-        return "not_found", "file not in DB (will be processed as new)"
+    # Use UPSERT on (folder_path, filename) to move/update record
+    try:
+        db_record = {
+            "filename": metadata["filename"],
+            "folder_path": metadata["folder_path"],
+            "auto_extracted_metadata": metadata["auto_extracted_metadata"],
+            "content_hash": content_hash,
+            "last_seen_at": now,
+            "deleted_at": None,
+            "db_updated_at": now,
+        }
+        # We don't have storage_path easily available here if we only have the hash.
+        # Let's fetch the storage_path from the existing hash record.
+        result = client.from_("files").select("storage_path").eq("content_hash", content_hash).limit(1).execute()
+        
+        if result.data:
+            db_record["storage_path"] = result.data[0]["storage_path"]
+            client.from_("files").upsert(db_record, on_conflict="folder_path,filename").execute()
+            return "updated", f"moved/upserted → {content_hash[:8]}"
+        else:
+            return "not_found", "file content (hash) not in DB"
+    except Exception as e:
+        return "error", f"move upsert failed: {e}"
 
 
 def scan_filesystem(source_path: Path) -> list[Path]:
@@ -285,8 +311,8 @@ def run_full_scan(source_paths: list[str], max_workers: int = DEFAULT_WORKERS) -
     scan_start = datetime.now(timezone.utc)
 
     logger.info("Full scan: Loading existing files from database...")
-    existing_files = fetch_existing_files(client)
-    logger.info(f"Full scan: Loaded {len(existing_files)} existing files")
+    hash_map, path_map = fetch_existing_files(client)
+    logger.info(f"Full scan: Loaded {len(hash_map)} hashes and {len(path_map)} paths")
 
     # Ensure bucket exists
     try:
@@ -319,7 +345,7 @@ def run_full_scan(source_paths: list[str], max_workers: int = DEFAULT_WORKERS) -
         def process_file(args):
             filepath, source_base = args
             file_client = get_supabase_client()
-            return process_single_file(filepath, source_base, existing_files, bucket, file_client)
+            return process_single_file(filepath, source_base, hash_map, path_map, bucket, file_client)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(process_file, args): args for args in all_files}
@@ -377,7 +403,7 @@ def process_watcher_events(events: list, source_paths: list[str]) -> tuple[int, 
     uploaded, updated, unchanged, errors = 0, 0, 0, 0
     bucket = settings.S3_BUCKET
     client = get_supabase_client()
-    existing_files = fetch_existing_files(client)
+    hash_map, path_map = fetch_existing_files(client)
     source_bases = [Path(p) for p in source_paths]
 
     def get_source_base(filepath: Path) -> Path | None:
@@ -403,7 +429,7 @@ def process_watcher_events(events: list, source_paths: list[str]) -> tuple[int, 
                         elif action == "not_found":
                             # Process as new file
                             filename, action, message = process_single_file(
-                                event.dest_path, source_base, existing_files, bucket, client
+                                event.dest_path, source_base, hash_map, path_map, bucket, client
                             )
                             if action == "uploaded":
                                 uploaded += 1
@@ -417,7 +443,7 @@ def process_watcher_events(events: list, source_paths: list[str]) -> tuple[int, 
                     source_base = get_source_base(event.path)
                     if source_base:
                         filename, action, message = process_single_file(
-                            event.path, source_base, existing_files, bucket, client
+                            event.path, source_base, hash_map, path_map, bucket, client
                         )
                         if action == "uploaded":
                             uploaded += 1
