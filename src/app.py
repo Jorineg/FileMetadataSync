@@ -14,7 +14,7 @@ from datetime import datetime
 
 from src import settings
 from src.logging_conf import logger
-from src.sync import run_full_scan, process_watcher_events, upsert_checkpoint
+from src.sync import run_full_scan, process_watcher_events
 from src.watcher import FileWatcher
 
 
@@ -35,16 +35,16 @@ class App:
         if not events:
             return
         try:
-            uploaded, updated, unchanged, errors = process_watcher_events(
+            registered, updated, unchanged, errors = process_watcher_events(
                 events, settings.SYNC_SOURCE_PATHS
             )
-            if uploaded or updated or errors:
+            if registered or updated or errors:
                 logger.info(
-                    f"Watcher batch: {uploaded} uploaded, {updated} updated, "
+                    f"Watcher batch: {registered} registered, {updated} updated, "
                     f"{unchanged} unchanged, {errors} errors"
                 )
-            if uploaded > 0:
-                upsert_checkpoint(datetime.now())
+            if registered > 0:
+                pass
         except Exception as e:
             logger.error(f"Error processing watcher events: {e}", exc_info=True)
 
@@ -77,16 +77,27 @@ class App:
             stats = run_full_scan(settings.SYNC_SOURCE_PATHS, settings.SYNC_WORKERS)
             self._last_full_scan_date = datetime.now().strftime("%Y-%m-%d")
             logger.info(
-                f"Full scan complete: {stats.uploaded} uploaded, {stats.updated} updated, "
+                f"Full scan complete: {stats.registered} registered, {stats.updated} updated, "
                 f"{stats.skipped_unchanged} unchanged, {stats.soft_deleted} soft-deleted, "
                 f"{stats.errors} errors in {stats.duration_human}"
             )
-            if stats.uploaded > 0:
-                upsert_checkpoint(datetime.now())
+            if stats.registered > 0:
+                pass
         except Exception as e:
             logger.error(f"Full scan failed: {e}", exc_info=True)
         finally:
             self._is_scanning = False
+
+    def _start_uploader(self):
+        """Run uploader in a separate thread with crash recovery."""
+        from src.uploader import Uploader
+        uploader = Uploader()
+        while self.running:
+            try:
+                uploader.run()
+            except Exception as e:
+                logger.error(f"Uploader thread crashed: {e}")
+                time.sleep(10)
 
     def run(self):
         """Main run loop."""
@@ -99,16 +110,17 @@ class App:
             logger.error(f"Configuration error: {e}")
             sys.exit(1)
 
-        logger.info("FileMetadataSync starting (hybrid mode)")
+        logger.info("FileMetadataSync starting (CAS Hybrid Mode)")
         logger.info(f"Source paths: {settings.SYNC_SOURCE_PATHS}")
         logger.info(f"Bucket: {settings.S3_BUCKET}")
         logger.info(f"Workers: {settings.SYNC_WORKERS}")
-        logger.info(f"Debounce: {settings.DEBOUNCE_SECONDS}s")
         logger.info(f"Full scan hour: {settings.FULL_SCAN_HOUR}:00")
-        logger.info(f"Full scan on startup: {settings.FULL_SCAN_ON_STARTUP}")
-        logger.info(f"Ignore patterns: {settings.IGNORE_PATTERNS}")
 
         try:
+            # Start uploader thread
+            uploader_thread = threading.Thread(target=self._start_uploader, daemon=True)
+            uploader_thread.start()
+
             # Optional initial full scan
             if settings.FULL_SCAN_ON_STARTUP:
                 self._run_full_scan(reason="startup")

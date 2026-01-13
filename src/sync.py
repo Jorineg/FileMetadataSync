@@ -1,15 +1,10 @@
 """
-File sync with hybrid mode: real-time watcher + daily full scan.
-
-Architecture:
-- Watcher handles create/modify/move events in real-time
-- Daily full scan reconciles state (soft-delete orphans, update paths)
-- Workers process files independently (hash → compare → upload → insert/update)
-- UUID-based storage paths, content_hash for deduplication
+File sync with CAS (Content-Addressable Storage) architecture.
+- Scanner/Watcher only registers files and hashes.
+- S3 uploads are handled by a separate Uploader component.
 """
 import os
 import time
-import uuid
 import hashlib
 import mimetypes
 from pathlib import Path
@@ -25,15 +20,14 @@ from src.logging_conf import logger
 
 UPLOAD_TIMEOUT = 300
 HASH_CHUNK_SIZE = 65536
-DEFAULT_WORKERS = 6
-
+DEFAULT_WORKERS = 4 # Reduced as it's now mostly I/O (hash + DB)
 
 @dataclass
 class SyncStats:
     """Statistics for a sync run."""
     total_files: int = 0
     skipped_unchanged: int = 0
-    uploaded: int = 0
+    registered: int = 0
     updated: int = 0
     soft_deleted: int = 0
     errors: int = 0
@@ -68,18 +62,12 @@ def compute_hash_streaming(filepath: Path) -> Optional[str]:
 
 
 def extract_file_metadata(filepath: Path, source_base: Path) -> dict:
-    """Extract metadata using stat() - no file read needed."""
+    """Extract metadata using stat()."""
     try:
         st = os.stat(filepath)
     except Exception as e:
         logger.error(f"Failed to stat {filepath}: {e}")
         return {}
-
-    try:
-        rel_path = filepath.relative_to(source_base)
-        folder_path = f"{source_base.name}/{rel_path.parent}" if rel_path.parent != Path(".") else source_base.name
-    except ValueError:
-        folder_path = str(filepath.parent)
 
     fs_attributes = {
         "size_bytes": st.st_size,
@@ -93,18 +81,19 @@ def extract_file_metadata(filepath: Path, source_base: Path) -> dict:
     auto_metadata = {
         "mime_type": mime_type,
         "extension": filepath.suffix.lower() if filepath.suffix else None,
-        "original_filename": filepath.name,
         "original_path": str(filepath),
         "source_base": str(source_base),
     }
 
     return {
-        "filename": filepath.name,
-        "folder_path": folder_path,
+        "full_path": str(filepath),
         "file_created_at": datetime.fromtimestamp(st.st_ctime, tz=timezone.utc).isoformat(),
         "file_modified_at": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+        "filesystem_inode": st.st_ino,
         "filesystem_attributes": fs_attributes,
         "auto_extracted_metadata": auto_metadata,
+        "size_bytes": st.st_size, # Needed for file_contents
+        "mime_type": mime_type,   # Needed for file_contents
     }
 
 
@@ -117,293 +106,168 @@ def get_supabase_client():
     )
 
 
-def fetch_existing_files(client) -> tuple[dict[str, dict], dict[tuple[str, str], dict]]:
+def fetch_path_map(client) -> dict[str, str]:
     """
-    Fetch all existing files from DB.
-    Returns: (hash_map, path_map)
-    hash_map: {content_hash: {id, filename, folder_path}}
-    path_map: {(folder_path, filename): {id, content_hash}}
+    Fetch all existing file paths from DB.
+    Returns: {full_path: content_hash}
     """
-    hash_map = {}
     path_map = {}
-    page_size = 1000
+    page_size = 2000
     offset = 0
 
     while True:
-        result = client.from_("files").select("id,content_hash,filename,folder_path").range(offset, offset + page_size - 1).execute()
+        result = client.from_("files").select("full_path,content_hash").range(offset, offset + page_size - 1).execute()
         if not result.data:
             break
         for row in result.data:
-            f_path = row.get("folder_path")
-            f_name = row.get("filename")
-            f_hash = row.get("content_hash")
-            
-            # Map by hash (for moved files)
-            if f_hash:
-                hash_map[f_hash] = {
-                    "id": row["id"],
-                    "filename": f_name,
-                    "folder_path": f_path
-                }
-            
-            # Map by path (for same-path duplicates/updates)
-            if f_name:
-                path_map[(f_path, f_name)] = {
-                    "id": row["id"],
-                    "content_hash": f_hash
-                }
-                
+            path_map[row["full_path"]] = row["content_hash"]
         if len(result.data) < page_size:
             break
         offset += page_size
 
-    return hash_map, path_map
+    return path_map
 
 
-def process_single_file(filepath: Path, source_base: Path, hash_map: dict, path_map: dict, bucket: str, client) -> tuple[str, str, str]:
+def process_single_file(filepath: Path, source_base: Path, path_map: dict, client) -> tuple[str, str, str]:
     """
-    Process a single file: hash → compare → upload/update using UPSERT.
+    Register a file in the DB: hash -> update file_contents -> update files reference.
     """
-    filename = filepath.name
+    full_path = str(filepath)
     now = datetime.now(timezone.utc).isoformat()
 
     content_hash = compute_hash_streaming(filepath)
     if not content_hash:
-        return filename, "error", "hash failed"
+        return full_path, "error", "hash failed"
+
+    # Quick check if unchanged in local cache
+    if path_map.get(full_path) == content_hash:
+        try:
+            client.from_("files").update({"last_seen_at": now}).eq("full_path", full_path).execute()
+            return full_path, "unchanged", "unchanged"
+        except Exception as e:
+            logger.warning(f"Failed to update last_seen_at for {full_path}: {e}")
+            return full_path, "unchanged", "last_seen_at update failed"
 
     metadata = extract_file_metadata(filepath, source_base)
     if not metadata:
-        return filename, "error", "metadata extraction failed"
-
-    folder_path = metadata["folder_path"]
-    path_key = (folder_path, filename)
-
-    # 1. Check if the exact PATH exists (Same Path Check)
-    existing_path = path_map.get(path_key)
-    if existing_path:
-        if existing_path["content_hash"] == content_hash:
-            # Hash matches path - just update last_seen_at
-            try:
-                client.from_("files").update({"last_seen_at": now}).eq("id", existing_path["id"]).execute()
-                return filename, "unchanged", "unchanged"
-            except Exception as e:
-                logger.warning(f"Failed to update last_seen_at for {existing_path['id']}: {e}")
-                return filename, "unchanged", "last_seen_at update failed"
-        else:
-            # Path exists but content changed - we need to upload
-            pass
-
-    storage_path = None
-    
-    # NEW or UPDATED file - upload
-    if not storage_path:
-        storage_uuid = str(uuid.uuid4())
-        extension = filepath.suffix.lower() if filepath.suffix else ""
-        storage_path = f"{storage_uuid}{extension}"
-
-        try:
-            with open(filepath, 'rb') as f:
-                file_data = f.read()
-            content_type, _ = mimetypes.guess_type(str(filepath))
-            client.storage.from_(bucket).upload(
-                storage_path, file_data,
-                file_options={"content-type": content_type or "application/octet-stream"}
-            )
-        except Exception as e:
-            return filename, "error", f"upload failed: {e}"
-
-    db_record = {
-        "storage_path": storage_path,
-        "content_hash": content_hash,
-        "last_seen_at": now,
-        "deleted_at": None,
-        "db_updated_at": now,
-        **metadata,
-    }
+        return full_path, "error", "metadata extraction failed"
 
     try:
-        # Use upsert with on_conflict on (folder_path, filename)
-        result = client.from_("files").upsert(db_record, on_conflict="folder_path,filename").execute()
-        if not result.data:
-            raise Exception("Upsert returned no data")
-        file_id = result.data[0].get("id", "unknown")
-        
-        # Update local maps
-        hash_map[content_hash] = {"id": file_id, "filename": filename, "folder_path": folder_path}
-        path_map[path_key] = {"id": file_id, "content_hash": content_hash}
-        
-        return filename, "uploaded", f"upserted → {file_id}"
-    except Exception as e:
-        # Cleanup storage if it was a brand new path
-        if not existing_path:
-            try:
-                client.storage.from_(bucket).remove([storage_path])
-            except Exception:
-                pass
-        return filename, "error", f"db upsert failed: {e}"
-
-
-def handle_move_event(src_path: Path, dest_path: Path, source_base: Path, client) -> tuple[str, str]:
-    """
-    Handle a file move/rename event.
-    Returns: (action, message)
-    """
-    # Compute hash of destination file
-    content_hash = compute_hash_streaming(dest_path)
-    if not content_hash:
-        return "error", "hash failed"
-
-    metadata = extract_file_metadata(dest_path, source_base)
-    if not metadata:
-        return "error", "metadata extraction failed"
-
-    now = datetime.now(timezone.utc).isoformat()
-
-    # Find existing file by hash
-    # Use UPSERT on (folder_path, filename) to move/update record
-    try:
-        db_record = {
-            "filename": metadata["filename"],
-            "folder_path": metadata["folder_path"],
-            "auto_extracted_metadata": metadata["auto_extracted_metadata"],
+        # 1. UPSERT into file_contents (Content-Addressable)
+        # We only set status to pending if it doesn't exist yet
+        content_record = {
             "content_hash": content_hash,
-            "last_seen_at": now,
-            "deleted_at": None,
+            "size_bytes": metadata.pop("size_bytes"),
+            "mime_type": metadata.pop("mime_type"),
             "db_updated_at": now,
         }
-        # We don't have storage_path easily available here if we only have the hash.
-        # Let's fetch the storage_path from the existing hash record.
-        result = client.from_("files").select("storage_path").eq("content_hash", content_hash).limit(1).execute()
+        client.from_("file_contents").upsert(content_record, on_conflict="content_hash").execute()
+
+        # 2. UPSERT into files (Path reference)
+        # This will also trigger project auto-linking in DB
+        file_record = {
+            "full_path": full_path,
+            "content_hash": content_hash,
+            "last_seen_at": now,
+            "deleted_at": None, # Resurrect if soft-deleted
+            "db_updated_at": now,
+            **metadata,
+        }
+        result = client.from_("files").upsert(file_record, on_conflict="full_path").execute()
         
-        if result.data:
-            db_record["storage_path"] = result.data[0]["storage_path"]
-            client.from_("files").upsert(db_record, on_conflict="folder_path,filename").execute()
-            return "updated", f"moved/upserted → {content_hash[:8]}"
-        else:
-            return "not_found", "file content (hash) not in DB"
+        if not result.data:
+            raise Exception("Upsert returned no data")
+            
+        # Update local map
+        path_map[full_path] = content_hash
+        
+        return full_path, "registered", f"registered ({content_hash[:8]})"
     except Exception as e:
-        return "error", f"move upsert failed: {e}"
-
-
-def scan_filesystem(source_path: Path) -> list[Path]:
-    """Scan directory and return list of file paths (excludes hidden and system dirs)."""
-    files = []
-    skip_dirs = {'.', '@eaDir', '#recycle', '.SynologyWorkingDirectory'}
-    for root, dirs, filenames in os.walk(source_path):
-        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in skip_dirs]
-        for filename in filenames:
-            if not filename.startswith('.'):
-                files.append(Path(root) / filename)
-    return files
+        return full_path, "error", f"db registration failed: {e}"
 
 
 def run_full_scan(source_paths: list[str], max_workers: int = DEFAULT_WORKERS) -> SyncStats:
-    """
-    Run a full filesystem scan with reconciliation.
-    - Uploads new files
-    - Updates paths for moved files
-    - Soft-deletes files no longer on filesystem
-    """
+    """Full filesystem reconciliation."""
     stats = SyncStats()
     stats.start_time = time.time()
-    bucket = settings.S3_BUCKET
     client = get_supabase_client()
     scan_start = datetime.now(timezone.utc)
 
-    logger.info("Full scan: Loading existing files from database...")
-    hash_map, path_map = fetch_existing_files(client)
-    logger.info(f"Full scan: Loaded {len(hash_map)} hashes and {len(path_map)} paths")
-
-    # Ensure bucket exists
-    try:
-        buckets = client.storage.list_buckets()
-        if not any(b.name == bucket for b in buckets):
-            client.storage.create_bucket(bucket, options={"public": False})
-            logger.info(f"Created bucket: {bucket}")
-    except Exception as e:
-        if "already exists" not in str(e).lower():
-            logger.error(f"Failed to ensure bucket exists: {e}")
-            stats.end_time = time.time()
-            return stats
+    logger.info("Full scan: Loading file map from database...")
+    path_map = fetch_path_map(client)
+    logger.info(f"Full scan: Loaded {len(path_map)} existing file paths")
 
     # Scan all source paths
-    all_files: list[tuple[Path, Path]] = []  # (filepath, source_base)
+    all_files: list[tuple[Path, Path]] = []
     for source_path_str in source_paths:
         source_path = Path(source_path_str)
         if not source_path.exists():
-            logger.warning(f"Source path does not exist: {source_path}")
             continue
-        for filepath in scan_filesystem(source_path):
-            all_files.append((filepath, source_path))
+        for root, dirs, filenames in os.walk(source_path):
+            # Same skip dirs as before
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in {'.', '@eaDir', '#recycle'}]
+            for filename in filenames:
+                if not filename.startswith('.'):
+                    all_files.append((Path(root) / filename, source_path))
 
     stats.total_files = len(all_files)
     logger.info(f"Full scan: Found {stats.total_files} files")
 
     if all_files:
-        logger.info(f"Full scan: Processing with {max_workers} workers...")
-
-        def process_file(args):
+        def worker_task(args):
             filepath, source_base = args
-            file_client = get_supabase_client()
-            return process_single_file(filepath, source_base, hash_map, path_map, bucket, file_client)
+            worker_client = get_supabase_client()
+            return process_single_file(filepath, source_base, path_map, worker_client)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(process_file, args): args for args in all_files}
+            futures = {executor.submit(worker_task, args): args for args in all_files}
             for i, future in enumerate(as_completed(futures), 1):
                 try:
-                    filename, action, message = future.result()
-                    if action == "uploaded":
-                        stats.uploaded += 1
-                        logger.info(f"[{i}/{stats.total_files}] {filename}: {message}")
-                    elif action == "updated":
-                        stats.updated += 1
-                        logger.info(f"[{i}/{stats.total_files}] {filename}: {message}")
+                    path, action, message = future.result()
+                    if action == "registered":
+                        stats.registered += 1
+                        logger.info(f"[{i}/{stats.total_files}] REG: {path}: {message}")
                     elif action == "unchanged":
                         stats.skipped_unchanged += 1
                     else:
                         stats.errors += 1
-                        logger.warning(f"[{i}/{stats.total_files}] {filename}: {message}")
+                        logger.warning(f"[{i}/{stats.total_files}] ERR: {path}: {message}")
                 except Exception as e:
                     stats.errors += 1
-                    logger.error(f"[{i}/{stats.total_files}] exception: {e}")
+                    logger.error(f"[{i}/{stats.total_files}] EXC: {e}")
 
                 if i % max(1, stats.total_files // 10) == 0:
                     logger.info(f"Full scan progress: {i*100//stats.total_files}%")
 
-    # Soft-delete files not seen during this scan (scoped to this instance's source paths)
-    logger.info("Full scan: Checking for deleted files...")
+    # Soft-delete cleanup
+    logger.info("Full scan: Marking deleted files...")
     for source_path_str in source_paths:
         try:
+            # We filter by full_path starting with the source base
+            # Note: Postgres needs to handle potential slash differences
             result = client.from_("files").update({
                 "deleted_at": scan_start.isoformat()
             }).lt("last_seen_at", scan_start.isoformat()) \
               .is_("deleted_at", "null") \
-              .eq("auto_extracted_metadata->>source_base", source_path_str) \
+              .ilike("full_path", f"{source_path_str}%") \
               .execute()
             
             if result.data:
                 stats.soft_deleted += len(result.data)
         except Exception as e:
             logger.error(f"Failed to soft-delete orphan files for {source_path_str}: {e}")
-    
-    if stats.soft_deleted > 0:
-        logger.info(f"Full scan: Soft-deleted {stats.soft_deleted} files no longer on filesystem")
 
     stats.end_time = time.time()
     return stats
 
 
 def process_watcher_events(events: list, source_paths: list[str]) -> tuple[int, int, int, int]:
-    """
-    Process events from the filesystem watcher.
-    Returns: (uploaded, updated, unchanged, errors)
-    """
-    from src.watcher import EventType, PendingEvent
+    """Process real-time events."""
+    from src.watcher import PendingEvent
     
-    uploaded, updated, unchanged, errors = 0, 0, 0, 0
-    bucket = settings.S3_BUCKET
+    registered, unchanged, errors = 0, 0, 0
     client = get_supabase_client()
-    hash_map, path_map = fetch_existing_files(client)
+    path_map = fetch_path_map(client)
     source_bases = [Path(p) for p in source_paths]
 
     def get_source_base(filepath: Path) -> Path | None:
@@ -418,57 +282,24 @@ def process_watcher_events(events: list, source_paths: list[str]) -> tuple[int, 
     for event in events:
         event: PendingEvent
         try:
-            if event.event_type == EventType.MOVED:
-                if event.dest_path and event.dest_path.exists():
-                    source_base = get_source_base(event.dest_path)
-                    if source_base:
-                        action, message = handle_move_event(event.path, event.dest_path, source_base, client)
-                        if action == "updated":
-                            updated += 1
-                            logger.info(f"Move: {event.path.name} → {event.dest_path.name}: {message}")
-                        elif action == "not_found":
-                            # Process as new file
-                            filename, action, message = process_single_file(
-                                event.dest_path, source_base, hash_map, path_map, bucket, client
-                            )
-                            if action == "uploaded":
-                                uploaded += 1
-                                logger.info(f"New (from move): {filename}: {message}")
-                        else:
-                            errors += 1
-                            logger.warning(f"Move error: {event.dest_path.name}: {message}")
-            else:
-                # Created or Modified
-                if event.path.exists():
-                    source_base = get_source_base(event.path)
-                    if source_base:
-                        filename, action, message = process_single_file(
-                            event.path, source_base, hash_map, path_map, bucket, client
-                        )
-                        if action == "uploaded":
-                            uploaded += 1
-                            logger.info(f"{event.event_type.value.title()}: {filename}: {message}")
-                        elif action == "updated":
-                            updated += 1
-                            logger.info(f"{event.event_type.value.title()}: {filename}: {message}")
-                        elif action == "unchanged":
-                            unchanged += 1
-                        else:
-                            errors += 1
-                            logger.warning(f"{event.event_type.value.title()} error: {filename}: {message}")
+            path = event.dest_path if event.dest_path else event.path
+            if path.exists():
+                source_base = get_source_base(path)
+                if source_base:
+                    _, action, message = process_single_file(path, source_base, path_map, client)
+                    if action == "registered":
+                        registered += 1
+                        logger.info(f"Watcher: {path.name}: {message}")
+                    elif action == "unchanged":
+                        unchanged += 1
+                    else:
+                        errors += 1
+                        logger.warning(f"Watcher error: {path.name}: {message}")
         except Exception as e:
             errors += 1
-            logger.error(f"Error processing event {event}: {e}", exc_info=True)
+            logger.error(f"Error processing event {event}: {e}")
 
-    return uploaded, updated, unchanged, errors
+    return registered, 0, unchanged, errors
 
 
-def upsert_checkpoint(last_event_time: Optional[datetime]) -> None:
-    """Upsert checkpoint to DB via RPC."""
-    client = get_supabase_client()
-    try:
-        params = {"p_last_event_time": last_event_time.isoformat() if last_event_time else None}
-        client.rpc("upsert_files_checkpoint", params).execute()
-        logger.debug("Checkpoint saved")
-    except Exception as e:
-        logger.warning(f"Failed to save checkpoint: {e}")
+
