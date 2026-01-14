@@ -105,3 +105,15 @@ class Uploader:
             self.client.rpc("mark_upload_skipped", {"p_hash": content_hash, "p_reason": reason}).execute()
         except Exception:
             pass
+
+    def reset_stuck_uploads(self):
+        """Reset any uploads stuck in 'uploading' state (called on startup)."""
+        try:
+            if not self.client:
+                self.client = get_supabase_client()
+            result = self.client.rpc("reset_stuck_uploads").execute()
+            count = result.data if result.data else 0
+            if count:
+                logger.info(f"Reset {count} stuck uploads on startup")
+        except Exception as e:
+            logger.warning(f"Could not reset stuck uploads: {e}")
