@@ -92,6 +92,10 @@ class App:
         """Run uploader in a separate thread with crash recovery."""
         from src.uploader import Uploader
         uploader = Uploader()
+        
+        # Reset any uploads that were stuck in 'uploading' from previous run
+        uploader.reset_stuck_uploads()
+        
         while self.running:
             try:
                 uploader.run()

@@ -26,6 +26,6 @@ services:
       #   - /volume1/files:/data:ro
       # - /volume1/email_attachments:/data/email_attachments:ro
       # - ./logs:/app/logs
-      - ./test_data:/data/test_data:ro
-      - ../.cursor:/data/.cursor:ro
+      # - ./test_data:/data/test_data:ro
+      - /volume1/dashboard:/data/dashboard:ro
     restart: unless-stopped

@@ -18,9 +18,11 @@ from supabase import create_client, ClientOptions
 from src import settings
 from src.logging_conf import logger
 
-UPLOAD_TIMEOUT = 300
+# Timeout for DB/storage operations (seconds)
+# Note: supabase-py doesn't support separate connect/read timeouts
+CLIENT_TIMEOUT = 120  # 2 minutes - balance between fast failure and allowing operations
 HASH_CHUNK_SIZE = 65536
-DEFAULT_WORKERS = 4 # Reduced as it's now mostly I/O (hash + DB)
+DEFAULT_WORKERS = 4  # Reduced as it's now mostly I/O (hash + DB)
 
 @dataclass
 class SyncStats:
@@ -102,7 +104,10 @@ def get_supabase_client():
     return create_client(
         settings.SUPABASE_URL,
         settings.SUPABASE_SERVICE_KEY,
-        options=ClientOptions(postgrest_client_timeout=UPLOAD_TIMEOUT, storage_client_timeout=UPLOAD_TIMEOUT)
+        options=ClientOptions(
+            postgrest_client_timeout=CLIENT_TIMEOUT,
+            storage_client_timeout=CLIENT_TIMEOUT
+        )
     )
 
 
