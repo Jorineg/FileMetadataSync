@@ -88,9 +88,8 @@ def extract_file_metadata(filepath: Path, source_base: Path) -> dict:
     }
 
     return {
-        "full_path": str(filepath),
-        "file_created_at": datetime.fromtimestamp(st.st_ctime, tz=timezone.utc).isoformat(),
-        "file_modified_at": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+        "fs_mtime": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+        "fs_ctime": datetime.fromtimestamp(st.st_ctime, tz=timezone.utc).isoformat(),
         "filesystem_inode": st.st_ino,
         "filesystem_attributes": fs_attributes,
         "auto_extracted_metadata": auto_metadata,
@@ -133,11 +132,16 @@ def fetch_path_map(client) -> dict[str, str]:
     return path_map
 
 
+def normalize_path(path_str: str) -> str:
+    """Ensure path starts with / for consistency."""
+    return path_str if path_str.startswith('/') else '/' + path_str
+
+
 def process_single_file(filepath: Path, source_base: Path, path_map: dict, client) -> tuple[str, str, str]:
     """
     Register a file in the DB: hash -> update file_contents -> update files reference.
     """
-    full_path = str(filepath)
+    full_path = normalize_path(str(filepath))
     now = datetime.now(timezone.utc).isoformat()
 
     content_hash = compute_hash_streaming(filepath)
@@ -248,13 +252,12 @@ def run_full_scan(source_paths: list[str], max_workers: int = DEFAULT_WORKERS) -
     logger.info("Full scan: Marking deleted files...")
     for source_path_str in source_paths:
         try:
-            # We filter by full_path starting with the source base
-            # Note: Postgres needs to handle potential slash differences
+            normalized_source = normalize_path(source_path_str)
             result = client.from_("files").update({
                 "deleted_at": scan_start.isoformat()
             }).lt("last_seen_at", scan_start.isoformat()) \
               .is_("deleted_at", "null") \
-              .ilike("full_path", f"{source_path_str}%") \
+              .ilike("full_path", f"{normalized_source}%") \
               .execute()
             
             if result.data:
