@@ -23,12 +23,14 @@ from src.logging_conf import logger
 CLIENT_TIMEOUT = 120  # 2 minutes - balance between fast failure and allowing operations
 HASH_CHUNK_SIZE = 65536
 DEFAULT_WORKERS = 4  # Reduced as it's now mostly I/O (hash + DB)
+MAX_FILE_SIZE = 1 * 1024 * 1024 * 1024  # 1GB - skip larger files to prevent DoS
 
 @dataclass
 class SyncStats:
     """Statistics for a sync run."""
     total_files: int = 0
     skipped_unchanged: int = 0
+    skipped_security: int = 0  # Symlinks, oversized files
     registered: int = 0
     updated: int = 0
     soft_deleted: int = 0
@@ -50,6 +52,32 @@ class SyncStats:
         return f"{d/3600:.1f}h"
 
 
+def validate_file_security(filepath: Path, source_base: Path) -> tuple[bool, str]:
+    """
+    Validate file for security issues before processing.
+    Returns (is_safe, reason) - if not safe, reason explains why.
+    """
+    # Check symlink escape: symlinks must resolve within source_base
+    if filepath.is_symlink():
+        try:
+            real_path = filepath.resolve()
+            source_resolved = source_base.resolve()
+            if not str(real_path).startswith(str(source_resolved)):
+                return False, f"symlink escape: {filepath} -> {real_path}"
+        except (OSError, ValueError) as e:
+            return False, f"symlink resolution failed: {e}"
+    
+    # Check file size (use lstat to not follow symlinks)
+    try:
+        st = os.lstat(filepath)
+        if st.st_size > MAX_FILE_SIZE:
+            return False, f"file too large: {st.st_size / (1024**3):.2f}GB > 1GB limit"
+    except OSError as e:
+        return False, f"cannot stat file: {e}"
+    
+    return True, ""
+
+
 def compute_hash_streaming(filepath: Path) -> Optional[str]:
     """Compute SHA256 hash without loading entire file into memory."""
     try:
@@ -64,9 +92,9 @@ def compute_hash_streaming(filepath: Path) -> Optional[str]:
 
 
 def extract_file_metadata(filepath: Path, source_base: Path) -> dict:
-    """Extract metadata using stat()."""
+    """Extract metadata using lstat() to not follow symlinks."""
     try:
-        st = os.stat(filepath)
+        st = os.lstat(filepath)  # lstat doesn't follow symlinks
     except Exception as e:
         logger.error(f"Failed to stat {filepath}: {e}")
         return {}
@@ -143,6 +171,12 @@ def process_single_file(filepath: Path, source_base: Path, path_map: dict, clien
     """
     full_path = normalize_path(str(filepath))
     now = datetime.now(timezone.utc).isoformat()
+
+    # Security validation
+    is_safe, reason = validate_file_security(filepath, source_base)
+    if not is_safe:
+        logger.warning(f"Security skip: {filepath}: {reason}")
+        return full_path, "skipped", reason
 
     content_hash = compute_hash_streaming(filepath)
     if not content_hash:
@@ -238,6 +272,10 @@ def run_full_scan(source_paths: list[str], max_workers: int = DEFAULT_WORKERS) -
                         logger.info(f"[{i}/{stats.total_files}] REG: {path}: {message}")
                     elif action == "unchanged":
                         stats.skipped_unchanged += 1
+                    elif action == "skipped":
+                        stats.skipped_security += 1
+                        # Warning level ensures it goes to betterstack
+                        logger.warning(f"[{i}/{stats.total_files}] SKIP: {path}: {message}")
                     else:
                         stats.errors += 1
                         logger.warning(f"[{i}/{stats.total_files}] ERR: {path}: {message}")
