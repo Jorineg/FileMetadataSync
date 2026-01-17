@@ -74,7 +74,7 @@ class App:
 
         logger.info(f"Starting full scan ({reason})...")
         try:
-            stats = run_full_scan(settings.SYNC_SOURCE_PATHS, settings.SYNC_WORKERS)
+            stats = run_full_scan(settings.SYNC_SOURCE_PATHS, settings.SYNC_WORKERS, settings.FORCE_METADATA_UPDATE)
             self._last_full_scan_date = datetime.now().strftime("%Y-%m-%d")
             logger.info(
                 f"Full scan complete: {stats.registered} registered, {stats.updated} updated, "

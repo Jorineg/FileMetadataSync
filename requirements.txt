@@ -1,4 +1,5 @@
 python-dotenv==1.0.0
 logtail-python==0.2.8
-supabase>=2.11.0
+httpx>=0.27.0
+supabase>=2.11.0  # For S3 storage only - TODO: replace with direct S3 access
 watchdog>=4.0.0

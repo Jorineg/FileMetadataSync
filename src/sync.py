@@ -13,24 +13,21 @@ from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-from supabase import create_client, ClientOptions
-
 from src import settings
 from src.logging_conf import logger
+from src.postgrest import PostgRESTClient
 
-# Timeout for DB/storage operations (seconds)
-# Note: supabase-py doesn't support separate connect/read timeouts
-CLIENT_TIMEOUT = 120  # 2 minutes - balance between fast failure and allowing operations
 HASH_CHUNK_SIZE = 65536
-DEFAULT_WORKERS = 4  # Reduced as it's now mostly I/O (hash + DB)
-MAX_FILE_SIZE = 1 * 1024 * 1024 * 1024  # 1GB - skip larger files to prevent DoS
+DEFAULT_WORKERS = 4
+MAX_FILE_SIZE = 1 * 1024 * 1024 * 1024  # 1GB
+
 
 @dataclass
 class SyncStats:
     """Statistics for a sync run."""
     total_files: int = 0
     skipped_unchanged: int = 0
-    skipped_security: int = 0  # Symlinks, oversized files
+    skipped_security: int = 0
     registered: int = 0
     updated: int = 0
     soft_deleted: int = 0
@@ -53,11 +50,7 @@ class SyncStats:
 
 
 def validate_file_security(filepath: Path, source_base: Path) -> tuple[bool, str]:
-    """
-    Validate file for security issues before processing.
-    Returns (is_safe, reason) - if not safe, reason explains why.
-    """
-    # Check symlink escape: symlinks must resolve within source_base
+    """Validate file for security issues before processing."""
     if filepath.is_symlink():
         try:
             real_path = filepath.resolve()
@@ -67,7 +60,6 @@ def validate_file_security(filepath: Path, source_base: Path) -> tuple[bool, str
         except (OSError, ValueError) as e:
             return False, f"symlink resolution failed: {e}"
     
-    # Check file size (use lstat to not follow symlinks)
     try:
         st = os.lstat(filepath)
         if st.st_size > MAX_FILE_SIZE:
@@ -94,7 +86,7 @@ def compute_hash_streaming(filepath: Path) -> Optional[str]:
 def extract_file_metadata(filepath: Path, source_base: Path) -> dict:
     """Extract metadata using lstat() to not follow symlinks."""
     try:
-        st = os.lstat(filepath)  # lstat doesn't follow symlinks
+        st = os.lstat(filepath)
     except Exception as e:
         logger.error(f"Failed to stat {filepath}: {e}")
         return {}
@@ -121,43 +113,9 @@ def extract_file_metadata(filepath: Path, source_base: Path) -> dict:
         "filesystem_inode": st.st_ino,
         "filesystem_attributes": fs_attributes,
         "auto_extracted_metadata": auto_metadata,
-        "size_bytes": st.st_size, # Needed for file_contents
-        "mime_type": mime_type,   # Needed for file_contents
+        "size_bytes": st.st_size,
+        "mime_type": mime_type,
     }
-
-
-def get_supabase_client():
-    """Create a new Supabase client."""
-    return create_client(
-        settings.SUPABASE_URL,
-        settings.SUPABASE_SERVICE_KEY,
-        options=ClientOptions(
-            postgrest_client_timeout=CLIENT_TIMEOUT,
-            storage_client_timeout=CLIENT_TIMEOUT
-        )
-    )
-
-
-def fetch_path_map(client) -> dict[str, str]:
-    """
-    Fetch all existing file paths from DB.
-    Returns: {full_path: content_hash}
-    """
-    path_map = {}
-    page_size = 2000
-    offset = 0
-
-    while True:
-        result = client.from_("files").select("full_path,content_hash").range(offset, offset + page_size - 1).execute()
-        if not result.data:
-            break
-        for row in result.data:
-            path_map[row["full_path"]] = row["content_hash"]
-        if len(result.data) < page_size:
-            break
-        offset += page_size
-
-    return path_map
 
 
 def normalize_path(path_str: str) -> str:
@@ -165,10 +123,8 @@ def normalize_path(path_str: str) -> str:
     return path_str if path_str.startswith('/') else '/' + path_str
 
 
-def process_single_file(filepath: Path, source_base: Path, path_map: dict, client) -> tuple[str, str, str]:
-    """
-    Register a file in the DB: hash -> update file_contents -> update files reference.
-    """
+def process_single_file(filepath: Path, source_base: Path, path_map: dict, client: PostgRESTClient, force_metadata: bool = False) -> tuple[str, str, str]:
+    """Register a file in the DB: hash -> update file_contents -> update files reference."""
     full_path = normalize_path(str(filepath))
     now = datetime.now(timezone.utc).isoformat()
 
@@ -182,14 +138,10 @@ def process_single_file(filepath: Path, source_base: Path, path_map: dict, clien
     if not content_hash:
         return full_path, "error", "hash failed"
 
-    # Quick check if unchanged in local cache
-    if path_map.get(full_path) == content_hash:
-        try:
-            client.from_("files").update({"last_seen_at": now}).eq("full_path", full_path).execute()
-            return full_path, "unchanged", "unchanged"
-        except Exception as e:
-            logger.warning(f"Failed to update last_seen_at for {full_path}: {e}")
-            return full_path, "unchanged", "last_seen_at update failed"
+    # Quick check if unchanged in local cache (skip if forcing metadata update)
+    if not force_metadata and path_map.get(full_path) == content_hash:
+        client.update_last_seen(full_path)
+        return full_path, "unchanged", "unchanged"
 
     metadata = extract_file_metadata(filepath, source_base)
     if not metadata:
@@ -197,29 +149,22 @@ def process_single_file(filepath: Path, source_base: Path, path_map: dict, clien
 
     try:
         # 1. UPSERT into file_contents (Content-Addressable)
-        # We only set status to pending if it doesn't exist yet
-        content_record = {
-            "content_hash": content_hash,
-            "size_bytes": metadata.pop("size_bytes"),
-            "mime_type": metadata.pop("mime_type"),
-            "db_updated_at": now,
-        }
-        client.from_("file_contents").upsert(content_record, on_conflict="content_hash").execute()
+        size_bytes = metadata.pop("size_bytes")
+        mime_type = metadata.pop("mime_type")
+        if not client.upsert_file_contents(content_hash, size_bytes, mime_type):
+            return full_path, "error", "file_contents upsert failed"
 
         # 2. UPSERT into files (Path reference)
-        # This will also trigger project auto-linking in DB
         file_record = {
             "full_path": full_path,
             "content_hash": content_hash,
             "last_seen_at": now,
-            "deleted_at": None, # Resurrect if soft-deleted
+            "deleted_at": None,
             "db_updated_at": now,
             **metadata,
         }
-        result = client.from_("files").upsert(file_record, on_conflict="full_path").execute()
-        
-        if not result.data:
-            raise Exception("Upsert returned no data")
+        if not client.upsert_file(file_record):
+            return full_path, "error", "files upsert failed"
             
         # Update local map
         path_map[full_path] = content_hash
@@ -229,15 +174,18 @@ def process_single_file(filepath: Path, source_base: Path, path_map: dict, clien
         return full_path, "error", f"db registration failed: {e}"
 
 
-def run_full_scan(source_paths: list[str], max_workers: int = DEFAULT_WORKERS) -> SyncStats:
+def run_full_scan(source_paths: list[str], max_workers: int = DEFAULT_WORKERS, force_metadata: bool = False) -> SyncStats:
     """Full filesystem reconciliation."""
     stats = SyncStats()
     stats.start_time = time.time()
-    client = get_supabase_client()
+    client = PostgRESTClient()
     scan_start = datetime.now(timezone.utc)
 
+    if force_metadata:
+        logger.info("Full scan: FORCE_METADATA_UPDATE enabled - will update metadata for all files")
+
     logger.info("Full scan: Loading file map from database...")
-    path_map = fetch_path_map(client)
+    path_map = client.fetch_path_map()
     logger.info(f"Full scan: Loaded {len(path_map)} existing file paths")
 
     # Scan all source paths
@@ -247,7 +195,6 @@ def run_full_scan(source_paths: list[str], max_workers: int = DEFAULT_WORKERS) -
         if not source_path.exists():
             continue
         for root, dirs, filenames in os.walk(source_path):
-            # Same skip dirs as before
             dirs[:] = [d for d in dirs if not d.startswith('.') and d not in {'.', '@eaDir', '#recycle'}]
             for filename in filenames:
                 if not filename.startswith('.'):
@@ -259,8 +206,8 @@ def run_full_scan(source_paths: list[str], max_workers: int = DEFAULT_WORKERS) -
     if all_files:
         def worker_task(args):
             filepath, source_base = args
-            worker_client = get_supabase_client()
-            return process_single_file(filepath, source_base, path_map, worker_client)
+            worker_client = PostgRESTClient()
+            return process_single_file(filepath, source_base, path_map, worker_client, force_metadata)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(worker_task, args): args for args in all_files}
@@ -274,7 +221,6 @@ def run_full_scan(source_paths: list[str], max_workers: int = DEFAULT_WORKERS) -
                         stats.skipped_unchanged += 1
                     elif action == "skipped":
                         stats.skipped_security += 1
-                        # Warning level ensures it goes to betterstack
                         logger.warning(f"[{i}/{stats.total_files}] SKIP: {path}: {message}")
                     else:
                         stats.errors += 1
@@ -289,19 +235,9 @@ def run_full_scan(source_paths: list[str], max_workers: int = DEFAULT_WORKERS) -
     # Soft-delete cleanup
     logger.info("Full scan: Marking deleted files...")
     for source_path_str in source_paths:
-        try:
-            normalized_source = normalize_path(source_path_str)
-            result = client.from_("files").update({
-                "deleted_at": scan_start.isoformat()
-            }).lt("last_seen_at", scan_start.isoformat()) \
-              .is_("deleted_at", "null") \
-              .ilike("full_path", f"{normalized_source}%") \
-              .execute()
-            
-            if result.data:
-                stats.soft_deleted += len(result.data)
-        except Exception as e:
-            logger.error(f"Failed to soft-delete orphan files for {source_path_str}: {e}")
+        normalized_source = normalize_path(source_path_str)
+        deleted = client.mark_deleted(normalized_source, scan_start.isoformat())
+        stats.soft_deleted += deleted
 
     stats.end_time = time.time()
     return stats
@@ -312,8 +248,8 @@ def process_watcher_events(events: list, source_paths: list[str]) -> tuple[int, 
     from src.watcher import PendingEvent
     
     registered, unchanged, errors = 0, 0, 0
-    client = get_supabase_client()
-    path_map = fetch_path_map(client)
+    client = PostgRESTClient()
+    path_map = client.fetch_path_map()
     source_bases = [Path(p) for p in source_paths]
 
     def get_source_base(filepath: Path) -> Path | None:
@@ -346,6 +282,3 @@ def process_watcher_events(events: list, source_paths: list[str]) -> tuple[int, 
             logger.error(f"Error processing event {event}: {e}")
 
     return registered, 0, unchanged, errors
-
-
-
